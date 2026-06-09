@@ -1,0 +1,10 @@
+{
+  "name": "sbus",
+  "version": "1.0.0",
+  "build": {
+    "srcFilter": [
+      "+<*.c>",
+      "+<*.h>"
+    ]
+  }
+}
