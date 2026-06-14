@@ -160,21 +160,20 @@ void app_main(void)
         // Get latest SBUS data
         xm_plus_data_t xm_data;
         xm_plus_get_data(&xm_data);
-        
-        // Check for failsafe / signal validity and update control directly
+
+        // Apply control policy based on SBUS validity
+        // ESP_LOGI(TAG, "Main loop: checking SBUS data (valid=%d failsafe=%d)", xm_data.data_valid, (xm_data.flags & 0x08) != 0);
         if (xm_data.data_valid) {
-            if (xm_data.flags & 0x08) {
-                if (control_is_armed()) {
-                    control_failsafe();
-                    ESP_LOGW(TAG, "Failsafe triggered - disarming");
-                }
+            // Receiver OK: update outputs; failsafe only affects motor cut.
+            if (xm_data.flags & SBUS_FAILSAFE_MASK) {
+                control_failsafe();
             } else {
                 control_update_from_sbus(xm_data.channels);
             }
         } else {
+            // Receiver invalid: trigger failsafe if armed
             if (control_is_armed()) {
                 control_failsafe();
-                ESP_LOGW(TAG, "Signal lost while armed - failsafe");
             }
         }
 

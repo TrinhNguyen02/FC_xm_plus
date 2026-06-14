@@ -40,9 +40,16 @@
 // ============================================================================
 // PWM Output Configuration
 // ============================================================================
-#define PIN_PWM_MOTOR           10  // Main motor/throttle (ESC)
-#define PIN_PWM_SERVO_L         1   // Left servo (aileron/elevator)
-#define PIN_PWM_SERVO_R         0   // Right servo (aileron/elevator)
+#define PIN_PWM_MOTOR           10  // Output currently driven by motor_us (Channel 3)
+
+// Legacy servo pins are disabled for this wiring/mapping update.
+// Channel outputs will be mapped as:
+//   CH1 (SBUS ch0) -> GPIO1
+//   CH2 (SBUS ch1) -> GPIO2
+//   CH4 (SBUS ch3) -> GPIO0
+#define PIN_PWM_SERVO_L         1
+#define PIN_PWM_SERVO_R         0
+
 
 // PWM settings for ESC and servos
 #define PWM_FREQ_HZ             50  // 50Hz for standard ESC/servo

@@ -134,6 +134,7 @@ static void xm_plus_task(void *arg)
         int bytes_read = uart_read_bytes(XM_PLUS_UART_PORT, &rx_byte, 1, 10);
         
         if (bytes_read > 0) {
+            // ESP_LOGI(TAG, "Received byte: 0x%02X", rx_byte);
             // Process byte through state machine
             if (sbus_process_byte(rx_byte)) {
                 // Frame complete - validate and decode
@@ -163,11 +164,11 @@ static void xm_plus_task(void *arg)
                                 frame_count++;
                                 // Log every frame
                                 // ESP_LOGI(TAG, "CH1:%4u CH2:%4u CH3:%4u CH4:%4u CH5:%4u CH6:%4u CH7:%4u CH8:%4u CH9:%4u CH10:%4u CH11:%4u CH12:%4u CH13:%4u CH14:%4u CH15:%4u CH16:%4u | Flags:0x%02X",
-                                        //  channels[0], channels[1], channels[2], channels[3],
-                                        //  channels[4], channels[5], channels[6], channels[7],
-                                        //  channels[8], channels[9], channels[10], channels[11],
-                                        //  channels[12], channels[13], channels[14], channels[15],
-                                        //  flags);
+                                //          channels[0], channels[1], channels[2], channels[3],
+                                //          channels[4], channels[5], channels[6], channels[7],
+                                //          channels[8], channels[9], channels[10], channels[11],
+                                //          channels[12], channels[13], channels[14], channels[15],
+                                //          flags);
                             }
                         }
                     }

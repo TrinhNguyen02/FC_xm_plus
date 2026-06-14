@@ -34,11 +34,12 @@ extern "C" {
  * Contains PWM values in microseconds for all controlled outputs.
  */
 typedef struct {
-    uint16_t motor_us;      ///< Motor/throttle PWM (1000-2000 us)
-    uint16_t servo_l_us;    ///< Left servo PWM (1000-2000 us)
-    uint16_t servo_r_us;    ///< Right servo PWM (1000-2000 us)
-    bool led1_state;        ///< LED 1 on/off state
-    bool led2_state;        ///< LED 2 on/off state
+    uint16_t throttle_us;  ///< Throttle PWM value (0-1000 us, center=500)
+    uint16_t roll_us;      ///< Roll PWM value (0-1000 us, center=500)
+    uint16_t pitch_us;     ///< Pitch PWM value (0-1000 us, center=500)
+    uint16_t yaw_us;       ///< Yaw PWM value (0-1000 us, center=500)
+    bool led1_state;       ///< LED 1 on/off state
+    bool led2_state;       ///< LED 2 on/off state
 } control_outputs_t;
 
 /**
