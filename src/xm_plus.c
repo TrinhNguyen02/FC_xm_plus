@@ -1,9 +1,15 @@
 /**
  * @file xm_plus.c
- * @brief XM+ SBUS Receiver Implementation for ESP32-C3 Flight Controller
+ * @brief XM+ SBUS Receiver - BetaFlight-style Implementation
  * 
- * This module handles communication with the FrSky XM+ receiver via SBUS protocol.
- * SBUS uses inverted UART at 100000 baud, 8 data bits, even parity, 2 stop bits.
+ * Based on BetaFlight's SBUS receiver implementation:
+ * https://github.com/betaflight/betaflight/blob/master/src/main/rx/sbus.c
+ * 
+ * Key features:
+ * - Byte-by-byte state machine parsing
+ * - Proper frame synchronization
+ * - Handles SBUS inverted UART protocol
+ * - Real-time performance optimized
  */
 
 #include "xm_plus.h"
@@ -11,7 +17,6 @@
 #include "sbus.h"
 
 #include <string.h>
-#include <stdio.h>
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -21,142 +26,188 @@
 
 static const char *TAG = "xm_plus";
 
+// SBUS protocol constants (matching BetaFlight)
+#define SBUS_FRAME_SIZE         25
+#define SBUS_HEADER_BYTE        0x0F
+#define SBUS_FOOTER_BYTE        0x00
+#define SBUS_CHANNEL_COUNT      16
+#define SBUS_FRAME_INTERVAL_MS  7  // ~14ms between frames (72Hz) but can vary
+
+// Parser state machine states (BetaFlight style)
+typedef enum {
+    SBUS_SYNC,      // Looking for header byte
+    SBUS_DATA,      // Collecting frame data
+    SBUS_DONE       // Frame complete
+} sbus_state_t;
+
+// Static data
 static xm_plus_data_t s_xm_data = {0};
 static SemaphoreHandle_t s_xm_mutex = NULL;
 static TaskHandle_t s_xm_task_handle = NULL;
 static bool s_initialized = false;
 
-static uint8_t s_rx_buffer[128];
-static uint8_t s_parser_buffer[256];
-static int s_parser_write_idx = 0;
+// Parser state (BetaFlight style)
+static sbus_state_t s_state = SBUS_SYNC;
+static uint8_t s_frame[SBUS_FRAME_SIZE];
+static uint8_t s_frame_position = 0;
+static uint32_t s_last_frame_time = 0;
 
-static bool validate_sbus_frame(const uint8_t frame[SBUS_FRAME_SIZE])
+/**
+ * @brief Process received byte using BetaFlight-style state machine
+ * 
+ * State machine:
+ * - SBUS_SYNC: Wait for 0x0F header byte
+ * - SBUS_DATA: Collect 24 more bytes (positions 1-24)
+ * - When 25 bytes collected, validate and decode
+ */
+ static bool sbus_process_byte(uint8_t byte)
 {
-    // Check frame header
-    if (frame[0] != 0x0F) {
+
+    switch (s_state) {
+        case SBUS_SYNC:
+            if (byte == SBUS_HEADER_BYTE) {
+                memset(s_frame, 0, sizeof(s_frame));
+                s_frame[0] = byte;
+                s_frame_position = 1;
+                s_state = SBUS_DATA;
+            }
+            break;
+            
+        case SBUS_DATA:
+            s_frame[s_frame_position] = byte;
+            s_frame_position++;
+            
+            // Check if frame is complete
+            if (s_frame_position >= SBUS_FRAME_SIZE) {
+                s_state = SBUS_SYNC;
+                s_frame_position = 0;
+                return true;  // Frame complete
+            }
+            break;
+            
+        default:
+            s_state = SBUS_SYNC;
+            s_frame_position = 0;
+            break;
+    }
+    
+    return false;
+}
+
+/**
+ * @brief Validate SBUS frame (BetaFlight style)
+ * 
+ * Checks:
+ * - Header byte is 0x0F
+ * - Footer byte is 0x00
+ */
+static bool sbus_validate_frame(const uint8_t *frame)
+{
+    // Check header
+    if (frame[0] != SBUS_HEADER_BYTE) {
         return false;
     }
     
-    // Check that all channel values are within valid SBUS range (172-1811)
-    for (int i = 0; i < 16; i++) {
-        uint16_t ch = (frame[1 + i * 2] << 8) | frame[2 + i * 2];
-        // Only check first few bytes since SBUS is packed differently
-        // We'll validate after decoding instead
+    // Check footer - can be 0x00 depending on receiver
+    uint8_t footer = frame[SBUS_FRAME_SIZE - 1];
+    if (footer != SBUS_FOOTER_BYTE && footer != 0x04) {
+        return false;
     }
-    
+
     return true;
 }
 
-static int process_sbus_frames(void)
-{
-    int frames_processed = 0;
-    
-    for (int i = 0; i <= s_parser_write_idx - SBUS_FRAME_SIZE; i++) {
-        if (s_parser_buffer[i] == 0x0F) {
-            uint8_t frame[SBUS_FRAME_SIZE];
-            memcpy(frame, &s_parser_buffer[i], SBUS_FRAME_SIZE);
-            
-            if (validate_sbus_frame(frame)) {
-                uint16_t channels[SBUS_CHANNEL_COUNT];
-                uint8_t flags = 0;
-                
-                if (sbus_decode_frame(frame, channels, &flags)) {
-                    // Validate channel values - SBUS range is 172-1811
-                    bool valid_frame = true;
-                    for (int ch = 0; ch < 16; ch++) {
-                        if (channels[ch] < 100 || channels[ch] > 2000) {
-                            valid_frame = false;
-                            break;
-                        }
-                    }
-                    
-                    if (valid_frame && xSemaphoreTake(s_xm_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                        memcpy(s_xm_data.channels, channels, sizeof(channels));
-                        s_xm_data.flags = flags;
-                        s_xm_data.data_valid = true;
-                        s_xm_data.last_update = xTaskGetTickCount();
-                        xSemaphoreGive(s_xm_mutex);
-                        frames_processed++;
-                        
-                        ESP_LOGI(TAG, "CH1:%4u CH2:%4u CH3:%4u CH4:%4u CH5:%4u CH6:%4u CH7:%4u CH8:%4u CH9:%4u CH10:%4u CH11:%4u CH12:%4u CH13:%4u CH14:%4u CH15:%4u CH16:%4u | Flags:0x%02X",
-                                 channels[0], channels[1], channels[2], channels[3],
-                                 channels[4], channels[5], channels[6], channels[7],
-                                 channels[8], channels[9], channels[10], channels[11],
-                                 channels[12], channels[13], channels[14], channels[15],
-                                 flags);
-                    }
-                }
-            }
-            i += SBUS_FRAME_SIZE - 1;
-        }
-    }
-    
-    return frames_processed;
-}
-
+/**
+ * @brief Main SBUS processing task (BetaFlight-style)
+ */
 static void xm_plus_task(void *arg)
 {
-    ESP_LOGI(TAG, "SBUS task started");
+    ESP_LOGI(TAG, "SBUS task started (BetaFlight-style)");
     
-    uint32_t last_status_log = xTaskGetTickCount();
-    uint32_t total_frames = 0;
-    uint32_t total_bytes = 0;
+    uint32_t frame_count = 0;
+    uint32_t invalid_count = 0;
+    uint32_t last_stats_time = xTaskGetTickCount();
     
     while (1) {
-        // Read bytes with short timeout to prevent WDT
-        int bytes_read = uart_read_bytes(XM_PLUS_UART_PORT, s_rx_buffer, 32, pdMS_TO_TICKS(5));
+        // Read one byte at a time (non-blocking)
+        uint8_t rx_byte;
+        int bytes_read = uart_read_bytes(XM_PLUS_UART_PORT, &rx_byte, 1, 10);
         
         if (bytes_read > 0) {
-            total_bytes += bytes_read;
-            
-            for (int i = 0; i < bytes_read && i < 32; i++) {
-                s_parser_buffer[s_parser_write_idx] = s_rx_buffer[i];
-                s_parser_write_idx++;
-                
-                if (s_parser_write_idx >= (int)sizeof(s_parser_buffer)) {
-                    memmove(s_parser_buffer, &s_parser_buffer[128], 128);
-                    s_parser_write_idx = 128;
+            ESP_LOGI(TAG, "Received byte: 0x%02X", rx_byte);
+            // Process byte through state machine
+            if (sbus_process_byte(rx_byte)) {
+                // Frame complete - validate and decode
+                if (sbus_validate_frame(s_frame)) {
+                    uint16_t channels[SBUS_CHANNEL_COUNT];
+                    uint8_t flags = 0;
+                    
+                    if (sbus_decode_frame(s_frame, channels, &flags)) {
+                        // Validate channel ranges (SBUS: 172-1811)
+                        bool valid = true;
+                        for (int i = 0; i < 16; i++) {
+                            if (channels[i] < 100 || channels[i] > 2048) {
+                                valid = false;  
+                                invalid_count++;
+                                break;
+                            }
+                        }
+                        
+                        if (valid) {
+                            // Update data under mutex
+                            if (xSemaphoreTake(s_xm_mutex, 0) == pdTRUE) {
+                                memcpy(s_xm_data.channels, channels, sizeof(channels));
+                                s_xm_data.flags = flags;
+                                s_xm_data.data_valid = true;
+                                s_xm_data.last_update = xTaskGetTickCount();
+                                xSemaphoreGive(s_xm_mutex);
+                                frame_count++;
+                                
+                                // Log every frame
+                                ESP_LOGI(TAG, "CH1:%4u CH2:%4u CH3:%4u CH4:%4u CH5:%4u CH6:%4u CH7:%4u CH8:%4u CH9:%4u CH10:%4u CH11:%4u CH12:%4u CH13:%4u CH14:%4u CH15:%4u CH16:%4u | Flags:0x%02X",
+                                         channels[0], channels[1], channels[2], channels[3],
+                                         channels[4], channels[5], channels[6], channels[7],
+                                         channels[8], channels[9], channels[10], channels[11],
+                                         channels[12], channels[13], channels[14], channels[15],
+                                         flags);
+                            }
+                        }
+                    }
+                } 
+                else {
+                    invalid_count++;
+                    ESP_LOGI(TAG, "Invalid SBUS frame: header=0x%02X footer=0x%02X", 
+                             s_frame[0], s_frame[24]);
+                    memset(s_frame, 0, sizeof(s_frame));
                 }
-            }
-            
-            int frames = process_sbus_frames();
-            total_frames += frames;
-            
-            // Clean up buffer
-            if (s_parser_write_idx > 128) {
-                int keep_bytes = s_parser_write_idx - 128;
-                memmove(s_parser_buffer, &s_parser_buffer[128], keep_bytes);
-                s_parser_write_idx = keep_bytes;
             }
         }
         
-        // Always yield to prevent WDT
-        vTaskDelay(pdMS_TO_TICKS(1));
+        // Yield to prevent WDT (BetaFlight uses cooperative scheduling)
+        vTaskDelay(0);
         
-        // Status check every second
+        // Periodic status check
         uint32_t now = xTaskGetTickCount();
-        if (now - last_status_log >= pdMS_TO_TICKS(1000)) {
-            last_status_log = now;
+        if (now - last_stats_time >= pdMS_TO_TICKS(5000)) {
+            uint32_t elapsed = now - last_stats_time;
+            float fps = (float)frame_count * 1000 / elapsed;
             
-            if (xSemaphoreTake(s_xm_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                if (s_xm_data.data_valid) {
-                    if (now - s_xm_data.last_update > pdMS_TO_TICKS(500)) {
-                        s_xm_data.data_valid = false;
-                        ESP_LOGW(TAG, "SBUS signal lost");
-                    }
+            ESP_LOGI(TAG, "Stats: %lu frames, %lu invalid, %.1f fps", 
+                     frame_count, invalid_count, fps);
+            
+            frame_count = 0;
+            invalid_count = 0;
+            last_stats_time = now;
+        }
+        
+        // Check for signal loss
+        if (s_xm_data.data_valid) {
+            if (xSemaphoreTake(s_xm_mutex, 0) == pdTRUE) {
+                if (now - s_xm_data.last_update > pdMS_TO_TICKS(500)) {
+                    s_xm_data.data_valid = false;
+                    ESP_LOGW(TAG, "SBUS signal lost");
                 }
                 xSemaphoreGive(s_xm_mutex);
-            }
-            
-            // Stats every 5 seconds
-            static uint32_t stats_timer = 0;
-            if (now - stats_timer >= pdMS_TO_TICKS(5000)) {
-                stats_timer = now;
-                ESP_LOGI(TAG, "Stats: %lu bytes, %lu frames, rate: %.1f fps", 
-                         total_bytes, total_frames, 
-                         (float)total_frames * 1000 / 5000);
-                total_bytes = 0;
-                total_frames = 0;
             }
         }
     }
@@ -169,25 +220,29 @@ bool xm_plus_init(void)
         return true;
     }
     
-    ESP_LOGI(TAG, "Initializing XM+ SBUS receiver on GPIO%d", PIN_XM_PLUS_UART_RX);
+    ESP_LOGI(TAG, "Initializing XM+ SBUS receiver (BetaFlight-style) on GPIO%d", 
+             PIN_XM_PLUS_UART_RX);
     
-    memset(s_parser_buffer, 0, sizeof(s_parser_buffer));
-    s_parser_write_idx = 0;
+    // Reset parser state
+    s_state = SBUS_SYNC;
+    s_frame_position = 0;
+    memset(s_frame, 0, sizeof(s_frame));
     
+    // Create mutex
     s_xm_mutex = xSemaphoreCreateMutex();
     if (s_xm_mutex == NULL) {
         ESP_LOGE(TAG, "Failed to create mutex");
         return false;
     }
     
+    // Configure UART for SBUS (inverted, 100000 baud, 8E2)
     uart_config_t uart_config = {
-        .baud_rate = XM_PLUS_BAUD_RATE,
+        .baud_rate = 100000,  // SBUS standard baud rate
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_EVEN,
         .stop_bits = UART_STOP_BITS_2,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_APB,
-        .rx_flow_ctrl_thresh = 122,
     };
     
     esp_err_t err = uart_param_config(XM_PLUS_UART_PORT, &uart_config);
@@ -197,28 +252,35 @@ bool xm_plus_init(void)
         return false;
     }
     
-    err = uart_set_pin(XM_PLUS_UART_PORT, UART_PIN_NO_CHANGE, PIN_XM_PLUS_UART_RX, 
-                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    // Set UART pins
+    err = uart_set_pin(XM_PLUS_UART_PORT, 
+                       UART_PIN_NO_CHANGE,
+                       PIN_XM_PLUS_UART_RX, 
+                       UART_PIN_NO_CHANGE, 
+                       UART_PIN_NO_CHANGE);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "uart_set_pin failed: %d", err);
         vSemaphoreDelete(s_xm_mutex);
         return false;
     }
     
-    err = uart_driver_install(XM_PLUS_UART_PORT, XM_PLUS_UART_BUF_SIZE, 0, 0, NULL, 0);
+    // Install UART driver
+    err = uart_driver_install(XM_PLUS_UART_PORT, 1024, 0, 0, NULL, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "uart_driver_install failed: %d", err);
         vSemaphoreDelete(s_xm_mutex);
         return false;
     }
     
+    // Enable RX inversion for SBUS
     err = uart_set_line_inverse(XM_PLUS_UART_PORT, UART_SIGNAL_RXD_INV);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "uart_set_line_inverse failed: %d", err);
     }
     
-    BaseType_t result = xTaskCreate(xm_plus_task, "xm_plus_task", TASK_XM_PLUS_STACK,
-                                    NULL, TASK_XM_PLUS_PRIORITY, &s_xm_task_handle);
+    // Create task
+    BaseType_t result = xTaskCreate(xm_plus_task, "xm_plus_task", 4096,
+                                    NULL, configMAX_PRIORITIES - 1, &s_xm_task_handle);
     if (result != pdPASS) {
         ESP_LOGE(TAG, "Failed to create SBUS task");
         uart_driver_delete(XM_PLUS_UART_PORT);
@@ -235,7 +297,7 @@ void xm_plus_get_data(xm_plus_data_t *data)
 {
     if (data == NULL || s_xm_mutex == NULL) return;
     
-    if (xSemaphoreTake(s_xm_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xSemaphoreTake(s_xm_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
         memcpy(data, &s_xm_data, sizeof(xm_plus_data_t));
         xSemaphoreGive(s_xm_mutex);
     }
@@ -246,7 +308,7 @@ bool xm_plus_get_channel(uint8_t channel, uint16_t *value)
     if (channel >= 16 || value == NULL || s_xm_mutex == NULL) return false;
     
     bool valid = false;
-    if (xSemaphoreTake(s_xm_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xSemaphoreTake(s_xm_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
         if (s_xm_data.data_valid) {
             *value = s_xm_data.channels[channel];
             valid = true;
