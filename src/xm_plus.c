@@ -109,10 +109,10 @@ static bool sbus_validate_frame(const uint8_t *frame)
     }
     
     // Check footer - can be 0x00 depending on receiver
-    uint8_t footer = frame[SBUS_FRAME_SIZE - 1];
-    if (footer != SBUS_FOOTER_BYTE && footer != 0x04) {
-        return false;
-    }
+    // uint8_t footer = frame[SBUS_FRAME_SIZE - 1];
+    // if (footer != SBUS_FOOTER_BYTE && footer != 0x04) {
+    //     return false;
+    // }
 
     return true;
 }
@@ -134,7 +134,6 @@ static void xm_plus_task(void *arg)
         int bytes_read = uart_read_bytes(XM_PLUS_UART_PORT, &rx_byte, 1, 10);
         
         if (bytes_read > 0) {
-            ESP_LOGI(TAG, "Received byte: 0x%02X", rx_byte);
             // Process byte through state machine
             if (sbus_process_byte(rx_byte)) {
                 // Frame complete - validate and decode
@@ -162,14 +161,13 @@ static void xm_plus_task(void *arg)
                                 s_xm_data.last_update = xTaskGetTickCount();
                                 xSemaphoreGive(s_xm_mutex);
                                 frame_count++;
-                                
                                 // Log every frame
-                                ESP_LOGI(TAG, "CH1:%4u CH2:%4u CH3:%4u CH4:%4u CH5:%4u CH6:%4u CH7:%4u CH8:%4u CH9:%4u CH10:%4u CH11:%4u CH12:%4u CH13:%4u CH14:%4u CH15:%4u CH16:%4u | Flags:0x%02X",
-                                         channels[0], channels[1], channels[2], channels[3],
-                                         channels[4], channels[5], channels[6], channels[7],
-                                         channels[8], channels[9], channels[10], channels[11],
-                                         channels[12], channels[13], channels[14], channels[15],
-                                         flags);
+                                // ESP_LOGI(TAG, "CH1:%4u CH2:%4u CH3:%4u CH4:%4u CH5:%4u CH6:%4u CH7:%4u CH8:%4u CH9:%4u CH10:%4u CH11:%4u CH12:%4u CH13:%4u CH14:%4u CH15:%4u CH16:%4u | Flags:0x%02X",
+                                        //  channels[0], channels[1], channels[2], channels[3],
+                                        //  channels[4], channels[5], channels[6], channels[7],
+                                        //  channels[8], channels[9], channels[10], channels[11],
+                                        //  channels[12], channels[13], channels[14], channels[15],
+                                        //  flags);
                             }
                         }
                     }
@@ -183,22 +181,29 @@ static void xm_plus_task(void *arg)
             }
         }
         
-        // Yield to prevent WDT (BetaFlight uses cooperative scheduling)
-        vTaskDelay(0);
+        // Give the scheduler a chance; also prevents task watchdog from firing
+        vTaskDelay(pdMS_TO_TICKS(1));
+
         
-        // Periodic status check
+        // Periodic status check (frame rate)
         uint32_t now = xTaskGetTickCount();
         if (now - last_stats_time >= pdMS_TO_TICKS(5000)) {
-            uint32_t elapsed = now - last_stats_time;
-            float fps = (float)frame_count * 1000 / elapsed;
-            
-            ESP_LOGI(TAG, "Stats: %lu frames, %lu invalid, %.1f fps", 
-                     frame_count, invalid_count, fps);
-            
+            uint32_t elapsed_ms = (now - last_stats_time) * portTICK_PERIOD_MS;
+            float fps = (elapsed_ms > 0)
+                         ? ((float)frame_count * 1000.0f / (float)elapsed_ms)
+                         : 0.0f;
+
+            ESP_LOGI(TAG, "Stats: %lu frames, %lu invalid, %.1f fps",
+                     (unsigned long)frame_count,
+                     (unsigned long)invalid_count,
+                     fps);
+
             frame_count = 0;
             invalid_count = 0;
             last_stats_time = now;
         }
+
+
         
         // Check for signal loss
         if (s_xm_data.data_valid) {

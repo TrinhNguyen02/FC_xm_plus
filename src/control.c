@@ -8,8 +8,12 @@
 
 #include "control.h"
 #include "config.h"
+#include "xm_plus.h"
+#include "sbus.h"
+
 
 #include <string.h>
+
 #include <stdio.h>
 #include "driver/ledc.h"
 #include "driver/gpio.h"
@@ -23,14 +27,27 @@ static const char *TAG = "control";
 // Static state for control system
 static control_outputs_t s_outputs = {0};
 static SemaphoreHandle_t s_control_mutex = NULL;
-static bool s_armed = false;
+static bool s_armed = true;
 static bool s_initialized = false;
 static bool s_failsafe_active = false;
 
+// Queue for passing SBUS decoded frames from main/xm_plus into control task
+static QueueHandle_t s_xm_queue = NULL;
+static TaskHandle_t s_control_task_handle = NULL;
+
+typedef struct {
+    xm_plus_data_t data;
+} control_queue_item_t;
+
+#define CONTROL_XM_QUEUE_LEN  3
+
+static void control_apply_from_xm(const xm_plus_data_t *xm);
+
+
 // LEDC channel assignments
-#define LEDC_CHANNEL_MOTOR   LEDC_CHANNEL_0
+#define LEDC_CHANNEL_MOTOR   LEDC_CHANNEL_2
 #define LEDC_CHANNEL_SERVO_L LEDC_CHANNEL_1
-#define LEDC_CHANNEL_SERVO_R LEDC_CHANNEL_2
+#define LEDC_CHANNEL_SERVO_R LEDC_CHANNEL_0
 
 /**
  * @brief Convert pulse width in microseconds to LEDC duty cycle value
@@ -123,6 +140,10 @@ bool control_init(void)
         ESP_LOGW(TAG, "Already initialized");
         return true;
     }
+
+    // NOTE: legacy queue/task code was disabled; it must not affect preprocessing.
+
+
     
     ESP_LOGI(TAG, "Initializing control system");
     
@@ -218,7 +239,7 @@ bool control_init(void)
     s_outputs.servo_r_us = SERVO_CENTER_US;
     s_outputs.led1_state = false;
     s_outputs.led2_state = false;
-    s_armed = false;
+    s_armed = true;
     s_failsafe_active = false;
     
     // Apply safe initial state
@@ -246,13 +267,31 @@ void control_update_from_sbus(const uint16_t channels[16])
         
         // Map SBUS channels to control outputs
         
-        // CH3 (Throttle) -> Motor
-        // Note: SBUS channel 2 is throttle (0-indexed)
-        if (s_armed) {
-            s_outputs.motor_us = sbus_to_us(channels[SBUS_CH_THROTTLE]);
-        } else {
-            s_outputs.motor_us = ESC_MIN_US;
+        // Motor/dimmer brightness from CH3 (index 2)
+        // Map SBUS 172..1811 -> duty 0..100%
+        uint16_t raw = channels[2];
+        if (raw < 172) raw = 172;
+        if (raw > 1811) raw = 1811;
+        uint32_t percent = (uint32_t)(raw - 172) * 100U / (uint32_t)(1811 - 172);
+
+        // Convert percent -> microseconds 0..1000, then to duty via LEDC mapping
+        uint16_t dim_us = (uint16_t)((percent * 1000U) / 100U); // 0..1000us
+
+        // Use motor_us field as dimmer pulse for GPIO10
+        // If disarmed, force 0%
+        
+        if (!s_armed) {
+            dim_us = 0;
         }
+        s_outputs.motor_us = dim_us;
+
+        // Debug log: GPIO10 PWM input (as we compute it)
+        ESP_LOGI(TAG, "GPIO10 dim debug: raw=%u percent=%lu dim_us=%u armed=%d",
+                 (unsigned)raw, (unsigned long)percent, (unsigned)dim_us, (int)s_armed);
+
+
+        // NOTE: Keep servos/LEDs logic unchanged below if you still want them.
+
         
         // CH1 (Aileron) + CH2 (Elevator) -> Servos
         // Mixing for V-tail or dual aileron configuration
@@ -408,9 +447,20 @@ void control_failsafe(void)
 
 void control_deinit(void)
 {
+    // Stop task/queue first (if running)
+    if (s_control_task_handle != NULL) {
+        vTaskDelete(s_control_task_handle);
+        s_control_task_handle = NULL;
+    }
+    if (s_xm_queue != NULL) {
+        vQueueDelete(s_xm_queue);
+        s_xm_queue = NULL;
+    }
+
     if (!s_initialized) {
         return;
     }
+
     
     // Set all outputs to safe state
     set_pwm_channel(LEDC_CHANNEL_MOTOR, ESC_MIN_US);
@@ -431,5 +481,105 @@ void control_deinit(void)
         s_control_mutex = NULL;
     }
     
-    ESP_LOGI(TAG, "Control system deinitialized");
+ESP_LOGI(TAG, "Control system deinitialized");
 }
+
+// ===== Queue/Task based control (removed for compatibility) =====
+
+#if 0
+static void control_apply_from_xm(const xm_plus_data_t *xm)
+{
+
+    if (xm == NULL) return;
+
+    if (!xm->data_valid) {
+        if (control_is_armed()) {
+            control_failsafe();
+        }
+        return;
+    }
+
+    if (xm->flags & 0x08) {
+        if (control_is_armed()) {
+            control_failsafe();
+        }
+        return;
+    }
+
+    // Normal operation: reuse legacy mapping logic by building channel array on stack.
+    // The control_update_from_sbus() expects channels[16].
+    control_update_from_sbus(xm->channels);
+}
+
+bool control_enqueue_xm(const xm_plus_data_t *data)
+{
+    if (data == NULL) return false;
+    if (s_xm_queue == NULL) return false;
+
+    control_queue_item_t item;
+    memcpy(&item.data, data, sizeof(xm_plus_data_t));
+
+    // overwrite oldest by draining if queue is full
+    if (uxQueueSpacesAvailable(s_xm_queue) == 0) {
+        control_queue_item_t dummy;
+        xQueueReceive(s_xm_queue, &dummy, 0);
+    }
+
+    return (xQueueSend(s_xm_queue, &item, 0) == pdTRUE);
+}
+
+static void control_task(void *arg)
+{
+    (void)arg;
+
+    ESP_LOGI(TAG, "control_task started");
+
+    control_queue_item_t newest;
+    control_queue_item_t tmp;
+
+    while (1) {
+        // Block until at least one item is available.
+        if (xQueueReceive(s_xm_queue, &newest, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        // Drain to the latest item so we don't lag behind.
+        while (xQueueReceive(s_xm_queue, &tmp, 0) == pdTRUE) {
+            newest = tmp;
+        }
+
+        // Apply latest
+        control_apply_from_xm(&newest.data);
+
+        vTaskDelay(1);
+    }
+}
+
+bool control_start_task(void)
+{
+
+    if (!s_initialized) return false;
+    if (s_xm_queue != NULL) return true;
+
+    s_xm_queue = xQueueCreate(CONTROL_XM_QUEUE_LEN, sizeof(control_queue_item_t));
+
+    if (s_xm_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create control XM queue");
+        return false;
+    }
+
+    BaseType_t ok = xTaskCreate(control_task, "control_task", 4096, NULL, configMAX_PRIORITIES - 3, &s_control_task_handle);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create control_task");
+        vQueueDelete(s_xm_queue);
+        s_xm_queue = NULL;
+        s_control_task_handle = NULL;
+        return false;
+    }
+
+    return true;
+}
+
+#endif // #if 0
+
+

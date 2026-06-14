@@ -21,6 +21,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "config.h"
+#include "xm_plus.h"
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,6 +65,7 @@ bool control_init(void);
  * 
  * @param channels Pointer to array of 16 SBUS channel values
  */
+// Legacy direct update (still present but main loop should use queue-based flow)
 void control_update_from_sbus(const uint16_t channels[16]);
 
 /**
@@ -118,6 +121,16 @@ void control_failsafe(void);
  * Stops PWM outputs and releases resources.
  */
 void control_deinit(void);
+
+/**
+ * @brief Push latest decoded SBUS data into control queue.
+ *
+ * Safe to call from the RX/main side. Control task will consume
+ * and apply outputs.
+ *
+ * @return true if enqueued successfully
+ */
+
 
 #ifdef __cplusplus
 }

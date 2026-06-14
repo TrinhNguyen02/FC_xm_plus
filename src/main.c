@@ -123,6 +123,7 @@ void app_main(void)
     }
     
     // Initialize XM+ SBUS receiver
+
     ESP_LOGI(TAG, "Initializing XM+ SBUS receiver...");
     if (!xm_plus_init()) {
         ESP_LOGE(TAG, "Failed to initialize XM+ receiver!");
@@ -160,28 +161,25 @@ void app_main(void)
         xm_plus_data_t xm_data;
         xm_plus_get_data(&xm_data);
         
-        // Check for failsafe
+        // Check for failsafe / signal validity and update control directly
         if (xm_data.data_valid) {
-            if (xm_data.flags & SBUS_FAILSAFE_MASK) {
-                // Receiver is in failsafe mode
+            if (xm_data.flags & 0x08) {
                 if (control_is_armed()) {
                     control_failsafe();
                     ESP_LOGW(TAG, "Failsafe triggered - disarming");
                 }
             } else {
-                // Normal operation - update control outputs from SBUS
                 control_update_from_sbus(xm_data.channels);
             }
         } else {
-            // No valid SBUS data - check if we should disarm
             if (control_is_armed()) {
-                // Lost signal while armed - trigger failsafe
                 control_failsafe();
                 ESP_LOGW(TAG, "Signal lost while armed - failsafe");
             }
         }
-        
+
         // Small delay to prevent watchdog triggers and allow other tasks
+
         vTaskDelay(pdMS_TO_TICKS(10));  // 100Hz main loop
     }
 }
