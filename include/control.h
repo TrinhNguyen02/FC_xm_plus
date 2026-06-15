@@ -28,18 +28,103 @@
 extern "C" {
 #endif
 
+// ============================================================================
+// SBUS Channel Mapping (FrSky/FLYSKY standard)
+// ============================================================================
+#define SBUS_CH_1              0   // Channel 1 (Aileron)
+#define SBUS_CH_2              1   // Channel 2 (Elevator)
+#define SBUS_CH_3              2   // Channel 3 (Throttle)
+#define SBUS_CH_4              3   // Channel 4 (Yaw)
+#define SBUS_CH_5              4   // Channel 5 (AUX1)
+#define SBUS_CH_6              5   // Channel 6 (AUX2)
+#define SBUS_CH_7              6   // Channel 7 (AUX3)
+#define SBUS_CH_8              7   // Channel 8 (AUX4)
+#define SBUS_CH_9              8   // Channel 9 (AUX5)
+#define SBUS_CH_10             9   // Channel 10 (AUX6)
+#define SBUS_CH_11             10  // Channel 11 (AUX7)
+#define SBUS_CH_12             11  // Channel 12 (AUX8)
+#define SBUS_CH_13             12  // Channel 13 (AUX9)
+#define SBUS_CH_14             13  // Channel 14 (AUX10)
+#define SBUS_CH_15             14  // Channel 15 (AUX11)
+#define SBUS_CH_16             15  // Channel 16 (AUX12)
+
+// ============================================================================
+// PWM Output Configuration for SG90 Servos
+// ============================================================================
+#define SG90_PWM_FREQ_HZ             50     // PWM frequency for ESC and servos
+#define SG90_PWM_MIN_US              1000   // Minimum pulse width in microseconds
+#define SG90_PWM_MAX_US              2000   // Maximum pulse width in microseconds
+#define SG90_PWM_CENTER_US           1500   // Center pulse width in microseconds
+#define SG90_PWM_RESOLUTION_BITS     16     // PWM resolution in bits (for LED
+
+// ============================================================================
+// PWM Output Configuration for general ESC
+// ============================================================================
+#define ESC_PWM_FREQ_HZ             400    // PWM frequency for ESC (can be 50Hz for analog ESC or 300/600Hz for digital ESC)
+#define ESC_PWM_MIN_US              1000   // Minimum pulse width in microseconds 
+#define ESC_PWM_MAX_US              2000   // Maximum pulse width in microseconds
+
+// ============================================================================
+// PWM Output Configuration for DSHOT ESC (uses digital protocol, so timing is different)
+// ============================================================================
+#define DSHOT_PWM_FREQ_HZ           600    // Effective frequency for DSHOT signals (not actual PWM frequency)
+#define DSHOT_PWM_MIN_US            125    // Minimum pulse width for DSHOT (represents DSHOT command 0)
+#define DSHOT_PWM_MAX_US            250    // Maximum pulse width for DSHOT (represents DSHOT command 48)
+
+/**
+ * @brief Control mode configuration
+ */
+typedef enum {
+    CONTROL_MODE_MANUAL,
+    CONTROL_MODE_STABILIZE,
+    CONTROL_MODE_ACRO,
+    CONTROL_MODE_ANGLE,
+} control_mode_t;
+
+/**
+ * @brief Output mode configuration
+ */
+typedef enum {
+    OUTPUT_TYPE_NONE = 0,
+    OUTPUT_TYPE_SERVO_SG90,
+    OUTPUT_TYPE_DSHOT300,
+    OUTPUT_TYPE_DSHOT600
+} output_type_t;
+
+/**
+ * @brief Set current output type (runtime)
+ * 
+ * This selects which output mapping/config is used inside control.c.
+ * @return true if accepted
+ */
+bool control_set_output_type(output_type_t type);
+
+
+/**
+ * @brief Output configuration structure
+ */
+typedef struct {
+    uint32_t frequency_hz;  
+    uint32_t min_value;
+    uint32_t max_value;
+    uint32_t center_value;
+    uint32_t resolution_bits;
+} output_config_t;
+
 /**
  * @brief Control surface data structure
  * 
- * Contains PWM values in microseconds for all controlled outputs.
+ * Contains PWM values in microseconds and digital output states.
  */
 typedef struct {
-    uint16_t throttle_us;  ///< Throttle PWM value (0-1000 us, center=500)
-    uint16_t roll_us;      ///< Roll PWM value (0-1000 us, center=500)
-    uint16_t pitch_us;     ///< Pitch PWM value (0-1000 us, center=500)
-    uint16_t yaw_us;       ///< Yaw PWM value (0-1000 us, center=500)
-    bool led1_state;       ///< LED 1 on/off state
-    bool led2_state;       ///< LED 2 on/off state
+    uint16_t pwm_ch1_us;   // Throttle PWM value (0-1000 us)
+    uint16_t pwm_ch2_us;   // Roll PWM value (0-1000 us, center=500)
+    uint16_t pwm_ch3_us;   // Pitch PWM value (0-1000 us, center=500)
+    uint16_t pwm_ch4_us;   // Yaw PWM value (0-1000 us, center=500)
+    uint16_t pwm_ch5_us;   // Auxiliary channel 1 (e.g. LED dimmer)
+    uint16_t pwm_ch6_us;   // Auxiliary channel 2 (e.g. LED dimmer)
+    uint8_t  dig_ch1_state;   // Digital output state for channel 1 (e.g. LED)
+    uint8_t  dig_ch2_state;   // Digital output state for channel 2 (e.g. LED)
 } control_outputs_t;
 
 /**

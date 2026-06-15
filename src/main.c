@@ -131,20 +131,20 @@ void app_main(void)
         return;
     }
     
-    // Create system monitor task
-    err = xTaskCreate(
-        monitor_task,
-        "monitor_task",
-        TASK_MONITOR_STACK,
-        NULL,
-        TASK_MONITOR_PRIORITY,
-        NULL
-    );
+    // // Create system monitor task
+    // err = xTaskCreate(
+    //     monitor_task,
+    //     "monitor_task",
+    //     TASK_MONITOR_STACK,
+    //     NULL,
+    //     TASK_MONITOR_PRIORITY,
+    //     NULL
+    // );
     
-    if (err != pdPASS) {
-        ESP_LOGW(TAG, "Failed to create monitor task");
-        // Continue anyway, monitor is not critical
-    }
+    // if (err != pdPASS) {
+    //     ESP_LOGW(TAG, "Failed to create monitor task");
+    //     // Continue anyway, monitor is not critical
+    // }
     
     ESP_LOGI(TAG, "Initialization complete. System running.");
     ESP_LOGI(TAG, "Free heap after init: %lu bytes", esp_get_free_heap_size());

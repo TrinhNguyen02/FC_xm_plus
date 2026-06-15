@@ -25,6 +25,12 @@
 extern "C" {
 #endif
 
+// SBUS protocol constants (matching BetaFlight)
+#define SBUS_FRAME_SIZE         25
+#define SBUS_HEADER_BYTE        0x0F
+#define SBUS_FOOTER_BYTE        0x00
+#define SBUS_CHANNEL_COUNT      16
+
 /**
  * @brief SBUS channel data structure
  * 
@@ -37,6 +43,13 @@ typedef struct {
     bool     data_valid;      ///< True if valid data has been received
     uint32_t last_update;     ///< Tick count of last valid frame
 } xm_plus_data_t;
+
+// Parser state machine states (BetaFlight style)
+typedef enum {
+    SBUS_SYNC,      // Looking for header byte
+    SBUS_DATA,      // Collecting frame data
+    SBUS_DONE       // Frame complete
+} sbus_state_t;
 
 /**
  * @brief Initialize the XM+ SBUS receiver interface

@@ -26,19 +26,6 @@
 
 static const char *TAG = "xm_plus";
 
-// SBUS protocol constants (matching BetaFlight)
-#define SBUS_FRAME_SIZE         25
-#define SBUS_HEADER_BYTE        0x0F
-#define SBUS_FOOTER_BYTE        0x00
-#define SBUS_CHANNEL_COUNT      16
-#define SBUS_FRAME_INTERVAL_MS  7  // ~14ms between frames (72Hz) but can vary
-
-// Parser state machine states (BetaFlight style)
-typedef enum {
-    SBUS_SYNC,      // Looking for header byte
-    SBUS_DATA,      // Collecting frame data
-    SBUS_DONE       // Frame complete
-} sbus_state_t;
 
 // Static data
 static xm_plus_data_t s_xm_data = {0};
@@ -109,10 +96,10 @@ static bool sbus_validate_frame(const uint8_t *frame)
     }
     
     // Check footer - can be 0x00 depending on receiver
-    // uint8_t footer = frame[SBUS_FRAME_SIZE - 1];
-    // if (footer != SBUS_FOOTER_BYTE && footer != 0x04) {
-    //     return false;
-    // }
+    uint8_t footer = frame[SBUS_FRAME_SIZE - 1];
+    if (footer != SBUS_FOOTER_BYTE && footer != 0x04) {
+        return false;
+    }
 
     return true;
 }
@@ -134,7 +121,6 @@ static void xm_plus_task(void *arg)
         int bytes_read = uart_read_bytes(XM_PLUS_UART_PORT, &rx_byte, 1, 10);
         
         if (bytes_read > 0) {
-            // ESP_LOGI(TAG, "Received byte: 0x%02X", rx_byte);
             // Process byte through state machine
             if (sbus_process_byte(rx_byte)) {
                 // Frame complete - validate and decode
