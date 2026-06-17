@@ -95,13 +95,16 @@ static esp_err_t init_nvs(void)
  */
 void app_main(void)
 {
+    vTaskDelay(pdMS_TO_TICKS(3000));  // Wait for system to stabilize
+    ESP_LOGI("BOOT", "boot ok");
+
     esp_err_t err;
     
     // Set log level
     esp_log_level_set(TAG, ESP_LOG_INFO);
     esp_log_level_set("xm_plus", ESP_LOG_INFO);
     esp_log_level_set("control", ESP_LOG_INFO);
-    
+
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  ESP32-C3 Flight Controller v1.0");
     ESP_LOGI(TAG, "========================================");
@@ -131,40 +134,21 @@ void app_main(void)
         return;
     }
     
-    // // Create system monitor task
-    // err = xTaskCreate(
-    //     monitor_task,
-    //     "monitor_task",
-    //     TASK_MONITOR_STACK,
-    //     NULL,
-    //     TASK_MONITOR_PRIORITY,
-    //     NULL
-    // );
-    
-    // if (err != pdPASS) {
-    //     ESP_LOGW(TAG, "Failed to create monitor task");
-    //     // Continue anyway, monitor is not critical
-    // }
-    
     ESP_LOGI(TAG, "Initialization complete. System running.");
     ESP_LOGI(TAG, "Free heap after init: %lu bytes", esp_get_free_heap_size());
     
     s_system_running = true;
     
-    // Main loop - monitors SBUS failsafe and calls control update
-    // The actual SBUS processing happens in the xm_plus task
-    // This loop just coordinates between subsystems
     while (1) {
         s_loop_counter++;
-        
+
         // Get latest SBUS data
         xm_plus_data_t xm_data;
         xm_plus_get_data(&xm_data);
 
         // Apply control policy based on SBUS validity
-        // ESP_LOGI(TAG, "Main loop: checking SBUS data (valid=%d failsafe=%d)", xm_data.data_valid, (xm_data.flags & 0x08) != 0);
         if (xm_data.data_valid) {
-            // Receiver OK: update outputs; failsafe only affects motor cut.
+            // ESP_LOGI(TAG, "Valid SBUS data received");
             if (xm_data.flags & SBUS_FAILSAFE_MASK) {
                 control_failsafe();
             } else {
@@ -178,7 +162,7 @@ void app_main(void)
         }
 
         // Small delay to prevent watchdog triggers and allow other tasks
-
         vTaskDelay(pdMS_TO_TICKS(10));  // 100Hz main loop
     }
 }
+

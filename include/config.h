@@ -29,8 +29,8 @@
 // ============================================================================
 // MPU Module Configuration (I2C) - For future development
 // ============================================================================
-#define PIN_MPU_SDA             8  // I2C SDA for MPU (optional
-#define PIN_MPU_SCL             9  // I2C SCL for MPU (optional)
+// #define PIN_MPU_SDA             8  // I2C SDA for MPU (optional
+// #define PIN_MPU_SCL             9  // I2C SCL for MPU (optional)
 
 // ============================================================================
 // PWM Output Configuration
@@ -61,6 +61,7 @@
 #define TASK_XM_PLUS_STACK      4096
 #define TASK_CONTROL_PRIORITY   (configMAX_PRIORITIES - 3)
 #define TASK_CONTROL_STACK      3072
-
+#define TASK_MONITOR_PRIORITY   (configMAX_PRIORITIES - 4)
+#define TASK_MONITOR_STACK      2048
 
 #endif // CONFIG_H

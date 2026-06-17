@@ -22,7 +22,7 @@
 #include <stdbool.h>
 #include "config.h"
 #include "xm_plus.h"
-
+#include "driver/gpio.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,10 +52,10 @@ extern "C" {
 // PWM Output Configuration for SG90 Servos
 // ============================================================================
 #define SG90_PWM_FREQ_HZ             50     // PWM frequency for ESC and servos
-#define SG90_PWM_MIN_US              1000   // Minimum pulse width in microseconds
-#define SG90_PWM_MAX_US              2000   // Maximum pulse width in microseconds
+#define SG90_PWM_MIN_US              500   // Minimum pulse width in microseconds
+#define SG90_PWM_MAX_US              2500   // Maximum pulse width in microseconds
 #define SG90_PWM_CENTER_US           1500   // Center pulse width in microseconds
-#define SG90_PWM_RESOLUTION_BITS     16     // PWM resolution in bits (for LED
+#define SG90_PWM_RESOLUTION_BITS     12     // PWM resolution in bits (for LED
 
 // ============================================================================
 // PWM Output Configuration for general ESC
@@ -71,34 +71,34 @@ extern "C" {
 #define DSHOT_PWM_MIN_US            125    // Minimum pulse width for DSHOT (represents DSHOT command 0)
 #define DSHOT_PWM_MAX_US            250    // Maximum pulse width for DSHOT (represents DSHOT command 48)
 
-/**
- * @brief Control mode configuration
- */
-typedef enum {
-    CONTROL_MODE_MANUAL,
-    CONTROL_MODE_STABILIZE,
-    CONTROL_MODE_ACRO,
-    CONTROL_MODE_ANGLE,
-} control_mode_t;
+#define CONTROL_MAX_OUTPUTS           8       // Max number of outputs (4 PWM + 2 digital)
 
+
+// ============================================================================
+// PWM timer channel mapping
+// ============================================================================
+#define TIM_CH_1 0
+#define TIM_CH_2 1
+#define TIM_CH_3 2
+#define TIM_CH_4 3
+#define TIM_CH_5 4
+#define TIM_CH_6 5
+
+
+
+// ============================================================================
+// Configuration output structure
+// ============================================================================
 /**
  * @brief Output mode configuration
  */
 typedef enum {
-    OUTPUT_TYPE_NONE = 0,
-    OUTPUT_TYPE_SERVO_SG90,
-    OUTPUT_TYPE_DSHOT300,
-    OUTPUT_TYPE_DSHOT600
-} output_type_t;
-
-/**
- * @brief Set current output type (runtime)
- * 
- * This selects which output mapping/config is used inside control.c.
- * @return true if accepted
- */
-bool control_set_output_type(output_type_t type);
-
+    CFG_OUTPUT_TYPE_NONE,
+    CFG_OUTPUT_TYPE_DIGITAL,
+    CFG_OUTPUT_TYPE_SERVO,
+    CFG_OUTPUT_TYPE_DSHOT300,
+    CFG_OUTPUT_TYPE_DSHOT600
+} cfg_output_type_t;
 
 /**
  * @brief Output configuration structure
@@ -109,12 +109,53 @@ typedef struct {
     uint32_t max_value;
     uint32_t center_value;
     uint32_t resolution_bits;
-} output_config_t;
+} cfg_pwm_output_t;
+
+/**
+ * @brief Output hardware type configuration
+ */
+typedef struct {
+    uint8_t timer_channel;
+    gpio_num_t gpio_num;
+    cfg_output_type_t type;
+    cfg_pwm_output_t pwm_config;
+} cfg_hw_output_t;
+
+static const cfg_pwm_output_t PWM_CONFIG_SERVO = {
+    .frequency_hz = SG90_PWM_FREQ_HZ,
+    .min_value = SG90_PWM_MIN_US,
+    .max_value = SG90_PWM_MAX_US,
+    .center_value = SG90_PWM_CENTER_US,
+    .resolution_bits = SG90_PWM_RESOLUTION_BITS
+};
+
+static const cfg_hw_output_t BOARD_OUTPUT_MAP[CONTROL_MAX_OUTPUTS] = {
+    { .timer_channel = TIM_CH_1, .gpio_num = PIN_PWM_1,    .type = CFG_OUTPUT_TYPE_SERVO   , .pwm_config = PWM_CONFIG_SERVO },
+    { .timer_channel = TIM_CH_2, .gpio_num = PIN_PWM_2,    .type = CFG_OUTPUT_TYPE_SERVO   , .pwm_config = PWM_CONFIG_SERVO },
+    { .timer_channel = TIM_CH_3, .gpio_num = PIN_PWM_3,    .type = CFG_OUTPUT_TYPE_SERVO   , .pwm_config = PWM_CONFIG_SERVO },
+    { .timer_channel = TIM_CH_4, .gpio_num = PIN_PWM_4,    .type = CFG_OUTPUT_TYPE_SERVO   , .pwm_config = PWM_CONFIG_SERVO },
+    { .timer_channel = TIM_CH_5, .gpio_num = PIN_PWM_5,    .type = CFG_OUTPUT_TYPE_NONE     , .pwm_config = {0} },
+    { .timer_channel = TIM_CH_6, .gpio_num = PIN_PWM_6,    .type = CFG_OUTPUT_TYPE_NONE     , .pwm_config = {0} },
+    { .timer_channel = 0, .gpio_num = PIN_OUTPUT_1, .type = CFG_OUTPUT_TYPE_DIGITAL  , .pwm_config = {0} },
+    { .timer_channel = 0, .gpio_num = PIN_OUTPUT_2, .type = CFG_OUTPUT_TYPE_DIGITAL  , .pwm_config = {0} }
+};
+
+// ============================================================================
+// Control structure definitions
+// ============================================================================
+/**
+ * @brief Control mode configuration
+ */
+typedef enum {
+    CONTROL_MODE_MANUAL,
+    CONTROL_MODE_STABILIZE,
+    CONTROL_MODE_ACRO,
+    CONTROL_MODE_ANGLE,
+} FC_control_mode_t;
+
 
 /**
  * @brief Control surface data structure
- * 
- * Contains PWM values in microseconds and digital output states.
  */
 typedef struct {
     uint16_t pwm_ch1_us;   // Throttle PWM value (0-1000 us)
@@ -123,9 +164,25 @@ typedef struct {
     uint16_t pwm_ch4_us;   // Yaw PWM value (0-1000 us, center=500)
     uint16_t pwm_ch5_us;   // Auxiliary channel 1 (e.g. LED dimmer)
     uint16_t pwm_ch6_us;   // Auxiliary channel 2 (e.g. LED dimmer)
-    uint8_t  dig_ch1_state;   // Digital output state for channel 1 (e.g. LED)
-    uint8_t  dig_ch2_state;   // Digital output state for channel 2 (e.g. LED)
-} control_outputs_t;
+    uint16_t dig_ch1_state;   // Digital output state for channel 1 (e.g. LED)
+    uint16_t dig_ch2_state;   // Digital output state for channel 2 (e.g. LED)
+    uint16_t dig_ch3_state;   // Digital output state for channel 3 (future use)
+    uint16_t dig_ch4_state;   // Digital output state for channel 4 (future use)
+    uint16_t dig_ch5_state;   // Digital output state for channel 5 (future use)
+    uint16_t dig_ch6_state;   // Digital output state for channel 6 (future use)
+    uint16_t dig_ch7_state;   // Digital output state for channel 7 (future use)
+    uint16_t dig_ch8_state;   // Digital output state for channel 8 (future use)
+    
+} ctrl_value_outputs_t;
+
+
+/**
+ * @brief Set current output type (runtime)
+ * 
+ * This selects which output mapping/config is used inside control.c.
+ * @return true if accepted
+ */
+bool control_set_output_type(cfg_output_type_t type);
 
 /**
  * @brief Initialize control system
@@ -161,14 +218,14 @@ void control_update_from_sbus(const uint16_t channels[16]);
  * 
  * @param outputs Pointer to control outputs structure
  */
-void control_set_outputs(const control_outputs_t *outputs);
+void control_set_outputs(const ctrl_value_outputs_t *outputs);
 
 /**
  * @brief Get current control output values
  * 
  * @param outputs Pointer to structure to receive current output values
  */
-void control_get_outputs(control_outputs_t *outputs);
+void control_get_outputs(ctrl_value_outputs_t *outputs);
 
 /**
  * @brief Arm the flight controller
