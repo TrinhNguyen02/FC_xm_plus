@@ -23,6 +23,8 @@
 #include "config.h"
 #include "xm_plus.h"
 #include "driver/gpio.h"
+#include "freertos/queue.h"
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -47,6 +49,9 @@ extern "C" {
 #define SBUS_CH_14             13  // Channel 14 (AUX10)
 #define SBUS_CH_15             14  // Channel 15 (AUX11)
 #define SBUS_CH_16             15  // Channel 16 (AUX12)
+
+#define SBUS_VALUE_MIN            172
+#define SBUS_VALUE_MAX            1811
 
 // ============================================================================
 // PWM Output Configuration for SG90 Servos
@@ -136,8 +141,8 @@ static const cfg_hw_output_t BOARD_OUTPUT_MAP[CONTROL_MAX_OUTPUTS] = {
     { .timer_channel = TIM_CH_4, .gpio_num = PIN_PWM_4,    .type = CFG_OUTPUT_TYPE_SERVO   , .pwm_config = PWM_CONFIG_SERVO },
     { .timer_channel = TIM_CH_5, .gpio_num = PIN_PWM_5,    .type = CFG_OUTPUT_TYPE_NONE     , .pwm_config = {0} },
     { .timer_channel = TIM_CH_6, .gpio_num = PIN_PWM_6,    .type = CFG_OUTPUT_TYPE_NONE     , .pwm_config = {0} },
-    { .timer_channel = 0, .gpio_num = PIN_OUTPUT_1, .type = CFG_OUTPUT_TYPE_DIGITAL  , .pwm_config = {0} },
-    { .timer_channel = 0, .gpio_num = PIN_OUTPUT_2, .type = CFG_OUTPUT_TYPE_DIGITAL  , .pwm_config = {0} }
+    { .timer_channel = 0,        .gpio_num = PIN_OUTPUT_1, .type = CFG_OUTPUT_TYPE_DIGITAL  , .pwm_config = {0} },
+    { .timer_channel = 0,        .gpio_num = PIN_OUTPUT_2, .type = CFG_OUTPUT_TYPE_DIGITAL  , .pwm_config = {0} }
 };
 
 // ============================================================================
@@ -264,6 +269,13 @@ void control_failsafe(void);
  * Stops PWM outputs and releases resources.
  */
 void control_deinit(void);
+
+// Provide a FreeRTOS queue handle that carries xm_plus_data_t from xm_plus_task.
+// control_task will consume from this queue.
+void control_set_sbus_queue(QueueHandle_t q);
+
+
+
 
 /**
  * @brief Push latest decoded SBUS data into control queue.

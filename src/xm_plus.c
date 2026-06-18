@@ -28,28 +28,26 @@ static const char *TAG = "xm_plus";
 
 
 // Static data
-static xm_plus_data_t s_xm_data = {0};
-static SemaphoreHandle_t s_xm_mutex = NULL;
-static TaskHandle_t s_xm_task_handle = NULL;
-static bool s_initialized = false;
+static xm_plus_data_t       s_xm_data = {0};
+static SemaphoreHandle_t    s_xm_mutex = NULL;
+static TaskHandle_t         s_xm_task_handle = NULL;
+static bool                 s_xm_initialized = false;
 
 // Parser state (BetaFlight style)
 static sbus_state_t s_state = SBUS_SYNC;
 static uint8_t s_frame[SBUS_FRAME_SIZE];
 static uint8_t s_frame_position = 0;
-static uint32_t s_last_frame_time = 0;
 
 /**
  * @brief Process received byte using BetaFlight-style state machine
- * 
+ *
  * State machine:
  * - SBUS_SYNC: Wait for 0x0F header byte
  * - SBUS_DATA: Collect 24 more bytes (positions 1-24)
  * - When 25 bytes collected, validate and decode
  */
- static bool sbus_process_byte(uint8_t byte)
+static bool sbus_process_byte(uint8_t byte)
 {
-
     switch (s_state) {
         case SBUS_SYNC:
             if (byte == SBUS_HEADER_BYTE) {
@@ -59,11 +57,11 @@ static uint32_t s_last_frame_time = 0;
                 s_state = SBUS_DATA;
             }
             break;
-            
+
         case SBUS_DATA:
             s_frame[s_frame_position] = byte;
             s_frame_position++;
-            
+
             // Check if frame is complete
             if (s_frame_position >= SBUS_FRAME_SIZE) {
                 s_state = SBUS_SYNC;
@@ -71,22 +69,23 @@ static uint32_t s_last_frame_time = 0;
                 return true;  // Frame complete
             }
             break;
-            
+
         default:
             s_state = SBUS_SYNC;
             s_frame_position = 0;
             break;
     }
-    
+
     return false;
 }
 
+
 /**
  * @brief Validate SBUS frame (BetaFlight style)
- * 
+ *
  * Checks:
  * - Header byte is 0x0F
- * - Footer byte is 0x00
+ * - Footer byte is 0x00 (some receivers may use 0x04)
  */
 static bool sbus_validate_frame(const uint8_t *frame)
 {
@@ -94,15 +93,17 @@ static bool sbus_validate_frame(const uint8_t *frame)
     if (frame[0] != SBUS_HEADER_BYTE) {
         return false;
     }
-    
-    // Check footer - can be 0x00 depending on receiver
+
+    // Check footer - some receivers may use 0x00 (standard) or 0x04
     uint8_t footer = frame[SBUS_FRAME_SIZE - 1];
-    if (footer != SBUS_FOOTER_BYTE && footer != 0x04) {
+    if (footer != SBUS_FOOTER_BYTE && footer != SBUS_FOOTER_2_BYTE) {
         return false;
     }
 
+
     return true;
 }
+
 
 /**
  * @brief Main SBUS processing task (BetaFlight-style)
@@ -118,21 +119,23 @@ static void xm_plus_task(void *arg)
     while (1) {
         // Read one byte at a time (non-blocking)
         uint8_t rx_byte;
-        int bytes_read = uart_read_bytes(XM_PLUS_UART_PORT, &rx_byte, 1, 10);
+        int bytes_read = uart_read_bytes(XM_PLUS_UART_PORT, &rx_byte, 1, SBUS_READ_TIMEOUT_MS);
+
         
         if (bytes_read > 0) {
             // Process byte through state machine
             if (sbus_process_byte(rx_byte)) {
                 // Frame complete - validate and decode
                 if (sbus_validate_frame(s_frame)) {
-                    uint16_t channels[SBUS_CHANNEL_COUNT];
+                    uint16_t channels[SBUS_CHANNEL];
                     uint8_t flags = 0;
                     
                     if (sbus_decode_frame(s_frame, channels, &flags)) {
                         // Validate channel ranges (SBUS: 172-1811)
                         bool valid = true;
                         for (int i = 0; i < 16; i++) {
-                            if (channels[i] < 100 || channels[i] > 2048) {
+                            if (channels[i] < SBUS_CHANNEL_VALUE_MIN || channels[i] > SBUS_CHANNEL_VALUE_MAX) {
+
                                 valid = false;  
                                 invalid_count++;
                                 break;
@@ -161,9 +164,11 @@ static void xm_plus_task(void *arg)
                 } 
                 else {
                     invalid_count++;
-                    ESP_LOGI(TAG, "Invalid SBUS frame: header=0x%02X footer=0x%02X", 
-                             s_frame[0], s_frame[24]);
+                    // Avoid flooding logs on noisy links.
+                    // ESP_LOGI(TAG, "Invalid SBUS frame: header=0x%02X footer=0x%02X", 
+                    //          s_frame[0], s_frame[24]);
                     memset(s_frame, 0, sizeof(s_frame));
+
                 }
             }
         }
@@ -174,13 +179,14 @@ static void xm_plus_task(void *arg)
         
         // Periodic status check (frame rate)
         uint32_t now = xTaskGetTickCount();
-        if (now - last_stats_time >= pdMS_TO_TICKS(5000)) {
+        if (now - last_stats_time >= pdMS_TO_TICKS(SBUS_STATUS_INTERVAL_MS)) {
+
             uint32_t elapsed_ms = (now - last_stats_time) * portTICK_PERIOD_MS;
             float fps = (elapsed_ms > 0)
                          ? ((float)frame_count * 1000.0f / (float)elapsed_ms)
                          : 0.0f;
 
-            ESP_LOGI(TAG, "Stats: %lu frames, %lu invalid, %.1f fps",
+            ESP_LOGI(TAG, "Status: %lu frames, %lu invalid, %.1f fps",
                      (unsigned long)frame_count,
                      (unsigned long)invalid_count,
                      fps);
@@ -190,12 +196,11 @@ static void xm_plus_task(void *arg)
             last_stats_time = now;
         }
 
-
-        
         // Check for signal loss
         if (s_xm_data.data_valid) {
             if (xSemaphoreTake(s_xm_mutex, 0) == pdTRUE) {
-                if (now - s_xm_data.last_update > pdMS_TO_TICKS(500)) {
+                if (now - s_xm_data.last_update > pdMS_TO_TICKS(SBUS_SIGNAL_LOST_TIMEOUT_MS)) {
+
                     s_xm_data.data_valid = false;
                     ESP_LOGW(TAG, "SBUS signal lost");
                 }
@@ -207,7 +212,7 @@ static void xm_plus_task(void *arg)
 
 bool xm_plus_init(void)
 {
-    if (s_initialized) {
+    if (s_xm_initialized) {
         ESP_LOGW(TAG, "Already initialized");
         return true;
     }
@@ -272,7 +277,7 @@ bool xm_plus_init(void)
     
     // Create task
     BaseType_t result = xTaskCreate(xm_plus_task, "xm_plus_task", 4096,
-                                    NULL, configMAX_PRIORITIES - 1, &s_xm_task_handle);
+                                    NULL, TASK_XM_PLUS_PRIORITY, &s_xm_task_handle);
     if (result != pdPASS) {
         ESP_LOGE(TAG, "Failed to create SBUS task");
         uart_driver_delete(XM_PLUS_UART_PORT);
@@ -280,7 +285,7 @@ bool xm_plus_init(void)
         return false;
     }
     
-    s_initialized = true;
+    s_xm_initialized = true;
     ESP_LOGI(TAG, "XM+ SBUS receiver initialized");
     return true;
 }
@@ -347,7 +352,7 @@ bool xm_plus_get_flags(uint8_t *flags)
 
 void xm_plus_deinit(void)
 {
-    if (!s_initialized) return;
+    if (!s_xm_initialized) return;
     
     if (s_xm_task_handle != NULL) {
         vTaskDelete(s_xm_task_handle);
@@ -362,7 +367,7 @@ void xm_plus_deinit(void)
     }
     
     memset(&s_xm_data, 0, sizeof(s_xm_data));
-    s_initialized = false;
+    s_xm_initialized = false;
     
     ESP_LOGI(TAG, "XM+ SBUS receiver deinitialized");
 }

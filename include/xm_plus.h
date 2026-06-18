@@ -29,7 +29,16 @@ extern "C" {
 #define SBUS_FRAME_SIZE         25
 #define SBUS_HEADER_BYTE        0x0F
 #define SBUS_FOOTER_BYTE        0x00
-#define SBUS_CHANNEL_COUNT      16
+#define SBUS_FOOTER_2_BYTE      0x04
+#define SBUS_CHANNEL            16
+
+#define SBUS_READ_TIMEOUT_MS    10
+
+#define SBUS_STATUS_INTERVAL_MS     5000            // Frame rate statistics interval
+#define SBUS_SIGNAL_LOST_TIMEOUT_MS 500
+
+#define SBUS_CHANNEL_VALUE_MIN 100
+#define SBUS_CHANNEL_VALUE_MAX 2048
 
 /**
  * @brief SBUS channel data structure
@@ -38,7 +47,7 @@ extern "C" {
  * Channel values range from 172 to 1811 (FrSky SBUS standard).
  */
 typedef struct {
-    uint16_t channels[16];    ///< 16 SBUS channel values (172-1811)
+    uint16_t channels[SBUS_CHANNEL];    ///< 16 SBUS channel values (172-1811)
     uint8_t  flags;           ///< SBUS flags (failsafe, frame lost, ch17, ch18)
     bool     data_valid;      ///< True if valid data has been received
     uint32_t last_update;     ///< Tick count of last valid frame

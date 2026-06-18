@@ -139,30 +139,30 @@ void app_main(void)
     
     s_system_running = true;
     
+    // Create message queue for decoded SBUS data.
+    // Overwrite semantics: keep latest frame.
+    QueueHandle_t sbus_queue = xQueueCreate(1, sizeof(xm_plus_data_t));
+    if (sbus_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create SBUS queue");
+    } else {
+        control_set_sbus_queue(sbus_queue);
+    }
+
     while (1) {
         s_loop_counter++;
 
-        // Get latest SBUS data
+        // Read latest SBUS data from xm_plus_task.
         xm_plus_data_t xm_data;
         xm_plus_get_data(&xm_data);
 
-        // Apply control policy based on SBUS validity
-        if (xm_data.data_valid) {
-            // ESP_LOGI(TAG, "Valid SBUS data received");
-            if (xm_data.flags & SBUS_FAILSAFE_MASK) {
-                control_failsafe();
-            } else {
-                control_update_from_sbus(xm_data.channels);
-            }
-        } else {
-            // Receiver invalid: trigger failsafe if armed
-            if (control_is_armed()) {
-                control_failsafe();
-            }
+        // Push into queue (overwrite semantics with queue length=1).
+        if (sbus_queue != NULL) {
+            // If queue is full, remove older item.
+            xQueueOverwrite(sbus_queue, &xm_data);
         }
 
-        // Small delay to prevent watchdog triggers and allow other tasks
-        vTaskDelay(pdMS_TO_TICKS(10));  // 100Hz main loop
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
+
 }
 
