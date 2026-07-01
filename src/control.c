@@ -134,25 +134,61 @@ static void control_task(void *arg)
 
     ESP_LOGI(TAG, "control_task started");
 
+    // Queue/Frame rate statistics
+    uint32_t frames_ok = 0;
+    uint32_t frames_total = 0;
+    uint32_t invalid_frames = 0;
+    uint32_t last_stats_time = xTaskGetTickCount();
+
+    // Limit stats/log interval
+    const TickType_t stats_interval_ticks = pdMS_TO_TICKS(SBUS_STATUS_INTERVAL_MS);
+
     while (1) {
         if (s_sbus_queue != NULL) {
+            // Non-blocking-ish receive with small timeout
             if (xQueueReceive(s_sbus_queue, &xm_data, pdMS_TO_TICKS(1)) == pdTRUE) {
+                frames_total++;
+
                 if (xm_data.data_valid) {
+                    frames_ok++;
                     control_update_from_sbus(xm_data.channels);
                 } else {
+                    invalid_frames++;
                     control_failsafe();
                 }
             }
         } else {
+            // If queue wasn't provided, just periodically apply current output state
             if (s_control_mutex != NULL && xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
                 apply_outputs_locked();
                 xSemaphoreGive(s_control_mutex);
             }
         }
+
+        // Periodic FPS based on received frames from queue
+        uint32_t now = xTaskGetTickCount();
+        if ((now - last_stats_time) >= stats_interval_ticks) {
+            uint32_t elapsed_ticks = now - last_stats_time;
+            uint32_t elapsed_ms = (elapsed_ticks * portTICK_PERIOD_MS);
+            float fps = (elapsed_ms > 0) ? ((float)frames_total * 1000.0f / (float)elapsed_ms) : 0.0f;
+
+            ESP_LOGI(TAG, "SBUS queue stats: total=%lu ok=%lu invalid=%lu freq=%.1f fps",
+                     (unsigned long)frames_total,
+                     (unsigned long)frames_ok,
+                     (unsigned long)invalid_frames,
+                     fps);
+
+            frames_ok = 0;
+            frames_total = 0;
+            invalid_frames = 0;
+            last_stats_time = now;
+        }
+
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
 }
+
 
 bool control_init(void)
 {
