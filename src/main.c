@@ -86,6 +86,16 @@ void app_main(void)
         // Continue anyway, NVS is not critical for basic operation
     }
     
+    // Create message queue for decoded SBUS data.
+    QueueHandle_t sbus_queue = xQueueCreate(SBUS_QUEUE_LENGTH, sizeof(xm_plus_data_t));
+
+    if (sbus_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create SBUS queue");
+    } else {
+        control_set_sbus_queue(sbus_queue);
+        xm_plus_set_output_queue(sbus_queue);
+    }
+
     // Initialize control system first (PWM outputs)
     // This ensures all outputs are in a safe state before we start reading inputs
     ESP_LOGI(TAG, "Initializing control system...");
@@ -106,34 +116,11 @@ void app_main(void)
     ESP_LOGI(TAG, "Free heap after init: %lu bytes", esp_get_free_heap_size());
     
     s_system_running = true;
-    
-    // Create message queue for decoded SBUS data.
-    // Mode: keep ALL frames (no overwrite). Queue size should be large enough to avoid drop.
-    // NOTE: If control_task can't keep up, FreeRTOS will block xQueueSend (we use short block time).
-    enum { SBUS_QUEUE_LENGTH = 32 };
-    QueueHandle_t sbus_queue = xQueueCreate(SBUS_QUEUE_LENGTH, sizeof(xm_plus_data_t));
 
-    if (sbus_queue == NULL) {
-        ESP_LOGE(TAG, "Failed to create SBUS queue");
-    } else {
-        control_set_sbus_queue(sbus_queue);
-    }
-
+    // main task idle loop: control work happens in xm_plus_task (decode)
+    // and control_task inside control.c.
     while (1) {
-        s_loop_counter++;
-
-        // Read latest SBUS data from xm_plus_task.
-        xm_plus_data_t xm_data;
-        xm_plus_get_data(&xm_data);
-
-        // Send to control task via queue (non-blocking, short timeout)
-        if (sbus_queue != NULL) {
-            if (xQueueSend(sbus_queue, &xm_data, pdMS_TO_TICKS(5)) != pdTRUE) {
-                ESP_LOGW(TAG, "SBUS queue full, dropping frame");
-            }
-        }
-        control_tmp();
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 

@@ -20,6 +20,8 @@
 #include "driver/uart.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,7 +34,8 @@ extern "C" {
 #define SBUS_FOOTER_2_BYTE      0x04
 #define SBUS_CHANNEL            16
 
-#define SBUS_READ_TIMEOUT_MS    10
+#define SBUS_QUEUE_LENGTH       1
+#define SBUS_READ_TIMEOUT_MS    1
 
 #define SBUS_STATUS_INTERVAL_MS     5000            // Frame rate statistics interval
 #define SBUS_SIGNAL_LOST_TIMEOUT_MS 500
@@ -118,6 +121,11 @@ bool xm_plus_get_flags(uint8_t *flags);
  * Stops the SBUS task and releases UART resources.
  */
 void xm_plus_deinit(void);
+
+// Provide a FreeRTOS queue handle that carries xm_plus_data_t from xm_plus_task.
+// The xm_plus task will overwrite the latest decoded SBUS frame into this queue.
+void xm_plus_set_output_queue(QueueHandle_t q);
+
 
 #ifdef __cplusplus
 }

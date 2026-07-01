@@ -33,6 +33,10 @@ static SemaphoreHandle_t    s_xm_mutex = NULL;
 static TaskHandle_t         s_xm_task_handle = NULL;
 static bool                 s_xm_initialized = false;
 
+// Optional queue for decoded SBUS data (overwrite latest frame)
+static QueueHandle_t       s_output_queue = NULL;
+
+
 // Parser state (BetaFlight style)
 static sbus_state_t s_state = SBUS_SYNC;
 static uint8_t s_frame[SBUS_FRAME_SIZE];
@@ -117,41 +121,49 @@ static void xm_plus_task(void *arg)
     uint32_t last_stats_time = xTaskGetTickCount();
     
     while (1) {
-        // Read one byte at a time (non-blocking)
-        uint8_t rx_byte;
-        int bytes_read = uart_read_bytes(XM_PLUS_UART_PORT, &rx_byte, 1, SBUS_READ_TIMEOUT_MS);
+        // Read bytes in a small block to reduce per-byte overhead.
+        uint8_t rx_buf[64];
+        int bytes_read = uart_read_bytes(XM_PLUS_UART_PORT, rx_buf, sizeof(rx_buf), SBUS_READ_TIMEOUT_MS);
 
-        
         if (bytes_read > 0) {
-            // Process byte through state machine
-            if (sbus_process_byte(rx_byte)) {
-                // Frame complete - validate and decode
-                if (sbus_validate_frame(s_frame)) {
-                    uint16_t channels[SBUS_CHANNEL];
-                    uint8_t flags = 0;
-                    
-                    if (sbus_decode_frame(s_frame, channels, &flags)) {
-                        // Validate channel ranges (SBUS: 172-1811)
-                        bool valid = true;
-                        for (int i = 0; i < 16; i++) {
-                            if (channels[i] < SBUS_CHANNEL_VALUE_MIN || channels[i] > SBUS_CHANNEL_VALUE_MAX) {
+            for (int i = 0; i < bytes_read; i++) {
+                uint8_t rx_byte = rx_buf[i];
+                // Process byte through state machine
+                if (sbus_process_byte(rx_byte)) {
+                    // Frame complete - validate and decode
+                    if (sbus_validate_frame(s_frame)) {
+                        uint16_t channels[SBUS_CHANNEL];
+                        uint8_t flags = 0;
 
-                                valid = false;  
-                                invalid_count++;
-                                break;
+                        if (sbus_decode_frame(s_frame, channels, &flags)) {
+                            // Validate channel ranges (SBUS: 172-1811)
+                            bool valid = true;
+                            for (int c = 0; c < SBUS_CHANNEL; c++) {
+                                if (channels[c] < SBUS_CHANNEL_VALUE_MIN || channels[c] > SBUS_CHANNEL_VALUE_MAX) {
+                                    valid = false;
+                                    invalid_count++;
+                                    break;
+                                }
                             }
-                        }
-                        
-                        if (valid) {
-                            // Update data under mutex
-                            if (xSemaphoreTake(s_xm_mutex, 0) == pdTRUE) {
-                                memcpy(s_xm_data.channels, channels, sizeof(channels));
-                                s_xm_data.flags = flags;
-                                s_xm_data.data_valid = true;
-                                s_xm_data.last_update = xTaskGetTickCount();
-                                xSemaphoreGive(s_xm_mutex);
-                                frame_count++;
-                                // Log every frame
+
+                            if (valid) {
+                                // Update data under mutex
+                                if (xSemaphoreTake(s_xm_mutex, 0) == pdTRUE) {
+                                    memcpy(s_xm_data.channels, channels, sizeof(channels));
+                                    s_xm_data.flags = flags;
+                                    s_xm_data.data_valid = true;
+                                    s_xm_data.last_update = xTaskGetTickCount();
+                                    xSemaphoreGive(s_xm_mutex);
+                                    frame_count++;
+
+                                    // Overwrite latest decoded frame into output queue
+                                    if (s_output_queue != NULL) {
+                                        xQueueOverwrite(s_output_queue, &s_xm_data);
+                                    }
+                                }
+
+                                // Logging each frame is very expensive and can trigger task watchdog.
+                                // Keep logs minimal; rely on periodic status print below.
                                 // ESP_LOGI(TAG, "CH1:%4u CH2:%4u CH3:%4u CH4:%4u CH5:%4u CH6:%4u CH7:%4u CH8:%4u CH9:%4u CH10:%4u CH11:%4u CH12:%4u CH13:%4u CH14:%4u CH15:%4u CH16:%4u | Flags:0x%02X",
                                 //          channels[0], channels[1], channels[2], channels[3],
                                 //          channels[4], channels[5], channels[6], channels[7],
@@ -160,25 +172,20 @@ static void xm_plus_task(void *arg)
                                 //          flags);
                             }
                         }
+                    } else {
+                        invalid_count++;
+                        memset(s_frame, 0, sizeof(s_frame));
                     }
-                } 
-                else {
-                    invalid_count++;
-                    // Avoid flooding logs on noisy links.
-                    // ESP_LOGI(TAG, "Invalid SBUS frame: header=0x%02X footer=0x%02X", 
-                    //          s_frame[0], s_frame[24]);
-                    memset(s_frame, 0, sizeof(s_frame));
-
                 }
             }
         }
-        
+
         // Give the scheduler a chance; also prevents task watchdog from firing
         vTaskDelay(pdMS_TO_TICKS(1));
 
-        
         // Periodic status check (frame rate)
         uint32_t now = xTaskGetTickCount();
+
         if (now - last_stats_time >= pdMS_TO_TICKS(SBUS_STATUS_INTERVAL_MS)) {
 
             uint32_t elapsed_ms = (now - last_stats_time) * portTICK_PERIOD_MS;
@@ -196,22 +203,23 @@ static void xm_plus_task(void *arg)
             last_stats_time = now;
         }
 
-        // Check for signal loss
+        // Check for signal loss (throttle mutex usage + avoid log spam)
         if (s_xm_data.data_valid) {
             if (xSemaphoreTake(s_xm_mutex, 0) == pdTRUE) {
                 if (now - s_xm_data.last_update > pdMS_TO_TICKS(SBUS_SIGNAL_LOST_TIMEOUT_MS)) {
-
                     s_xm_data.data_valid = false;
                     ESP_LOGW(TAG, "SBUS signal lost");
                 }
                 xSemaphoreGive(s_xm_mutex);
             }
         }
+        // End of loop
     }
 }
 
 bool xm_plus_init(void)
 {
+
     if (s_xm_initialized) {
         ESP_LOGW(TAG, "Already initialized");
         return true;
@@ -288,6 +296,11 @@ bool xm_plus_init(void)
     s_xm_initialized = true;
     ESP_LOGI(TAG, "XM+ SBUS receiver initialized");
     return true;
+}
+
+void xm_plus_set_output_queue(QueueHandle_t q)
+{
+    s_output_queue = q;
 }
 
 void xm_plus_get_data(xm_plus_data_t *data)

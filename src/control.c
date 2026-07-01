@@ -127,55 +127,32 @@ static void apply_outputs_locked(void)
     gpio_set_level(PIN_OUTPUT_2, s_value_output.dig_ch2_state ? 1 : 0);
 }
 
-void control_tmp(void)
+static void control_task(void *arg)
 {
-    // ESP_LOGI(TAG, "Control task started");
+    (void)arg;
     xm_plus_data_t xm_data;
 
+    ESP_LOGI(TAG, "control_task started");
+
+    while (1) {
         if (s_sbus_queue != NULL) {
-            // Receive SBUS frames in order (queue length > 1).
-            if (xQueueReceive(s_sbus_queue, &xm_data, pdMS_TO_TICKS(50)) == pdTRUE) {
-
+            if (xQueueReceive(s_sbus_queue, &xm_data, pdMS_TO_TICKS(1)) == pdTRUE) {
                 if (xm_data.data_valid) {
-
                     control_update_from_sbus(xm_data.channels);
                 } else {
-                    // Invalid or failsafe
                     control_failsafe();
                 }
             }
         } else {
-            // Fallback: apply current outputs periodically (old behavior)
-            if (s_control_mutex != NULL && xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (s_control_mutex != NULL && xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
                 apply_outputs_locked();
                 xSemaphoreGive(s_control_mutex);
             }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 
 }
-
-// static void apply_outputs(void)
-// {
-//     if (s_control_mutex == NULL) return;
-//     if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-//     apply_outputs_locked();
-//     xSemaphoreGive(s_control_mutex);
-// }
-
-// bool control_set_output_type(cfg_output_type_t type)
-// {
-    // if (type == OUTPUT_TYPE_NONE) return false;
-
-    // if (s_control_mutex != NULL && xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    //     s_output_type = type;
-    //     xSemaphoreGive(s_control_mutex);
-    //     return true;
-    // }
-
-    // // If not initialized yet, just set.
-    // s_output_type = type;
-    // return true;
-// }
 
 bool control_init(void)
 {
@@ -275,12 +252,14 @@ bool control_init(void)
         xSemaphoreGive(s_control_mutex);
     }
     
-    // BaseType_t result = xTaskCreate(control_task, "control_task", 4096, 
-    //                                     NULL, configMAX_PRIORITIES - 1, NULL);
-    // if (result != pdPASS) {
-    //     ESP_LOGE(TAG, "Failed to create control task");
-    //     return false;
-    // }
+    // Create control task (consumer) to read latest SBUS frame from queue.
+    BaseType_t result = xTaskCreate(control_task, "control_task", TASK_CONTROL_STACK,
+                                     NULL, TASK_CONTROL_PRIORITY, &s_ctrl_task_handle);
+    if (result != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create control_task");
+        return false;
+    }
+
 
     s_ctrl_initialized = true;
     ESP_LOGI(TAG, "Control system initialized successfully");
@@ -481,8 +460,6 @@ void control_deinit(void)
     for (int i = 0; i < 6; i++) {
         set_pwm_duty((ledc_channel_t)i, 0);
     }
-
-
 
     gpio_set_level(PIN_OUTPUT_1, 0);
     gpio_set_level(PIN_OUTPUT_2, 0);
