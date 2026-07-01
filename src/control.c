@@ -27,10 +27,12 @@ static const char *TAG = "control";
 // Static state for control system
 static ctrl_value_outputs_t s_value_output = {0};
 
-static SemaphoreHandle_t s_control_mutex = NULL;
+static SemaphoreHandle_t    s_control_mutex = NULL;
+static TaskHandle_t         s_ctrl_task_handle = NULL;
 static bool s_armed = false;
 static bool s_failsafe_active = false;
-static bool s_initialized = false;
+
+static bool s_ctrl_initialized = false;
 
 // Queue for decoded SBUS data (from xm_plus_task/main)
 static QueueHandle_t s_sbus_queue = NULL;
@@ -40,7 +42,6 @@ void control_set_sbus_queue(QueueHandle_t q);
 
 
 static void set_pwm_duty(ledc_channel_t ch, uint32_t duty)
-
 {
     ledc_set_duty(LEDC_LOW_SPEED_MODE, ch, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, ch);
@@ -126,16 +127,15 @@ static void apply_outputs_locked(void)
     gpio_set_level(PIN_OUTPUT_2, s_value_output.dig_ch2_state ? 1 : 0);
 }
 
-static void control_task(void *arg)
+void control_tmp(void)
 {
-    ESP_LOGI(TAG, "Control task started");
-
-    while (1) {
-        xm_plus_data_t xm_data;
+    // ESP_LOGI(TAG, "Control task started");
+    xm_plus_data_t xm_data;
 
         if (s_sbus_queue != NULL) {
-            // Wait for newest SBUS frame (overwrite semantics: keep last one).
-            if (xQueueReceive(s_sbus_queue, &xm_data, pdMS_TO_TICKS(100)) == pdTRUE) {
+            // Receive SBUS frames in order (queue length > 1).
+            if (xQueueReceive(s_sbus_queue, &xm_data, pdMS_TO_TICKS(50)) == pdTRUE) {
+
                 if (xm_data.data_valid) {
 
                     control_update_from_sbus(xm_data.channels);
@@ -150,10 +150,8 @@ static void control_task(void *arg)
                 apply_outputs_locked();
                 xSemaphoreGive(s_control_mutex);
             }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(20)); // ~50Hz
     }
+
 }
 
 // static void apply_outputs(void)
@@ -181,14 +179,10 @@ static void control_task(void *arg)
 
 bool control_init(void)
 {
-    if (s_initialized) {
+    if (s_ctrl_initialized) {
         ESP_LOGW(TAG, "Already initialized");
         return true;
     }
-
-// Queue created by main.c. If not set, control_task falls back to mutex-based periodic apply.
-
-
 
     s_control_mutex = xSemaphoreCreateMutex();
     if (s_control_mutex == NULL) {
@@ -281,47 +275,47 @@ bool control_init(void)
         xSemaphoreGive(s_control_mutex);
     }
     
-    BaseType_t result = xTaskCreate(control_task, "control_task", 4096, 
-                                        NULL, configMAX_PRIORITIES - 1, NULL);
-    if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create control task");
-        return false;
-    }
+    // BaseType_t result = xTaskCreate(control_task, "control_task", 4096, 
+    //                                     NULL, configMAX_PRIORITIES - 1, NULL);
+    // if (result != pdPASS) {
+    //     ESP_LOGE(TAG, "Failed to create control task");
+    //     return false;
+    // }
 
-    s_initialized = true;
+    s_ctrl_initialized = true;
     ESP_LOGI(TAG, "Control system initialized successfully");
     return true;
 }
 
 void control_update_from_sbus(const uint16_t channels[16])
 {
-    if (!s_initialized || channels == NULL) return;
+    if (!s_ctrl_initialized || channels == NULL) return;
 
-    if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
 
     // If we were in failsafe lock, first valid frame should release it.
     if (s_failsafe_active) {
         s_failsafe_active = false;
     }
 
-    ESP_LOGI(TAG,
-             "Channels: CH1=%u, CH2=%u, CH3=%u, CH4=%u, CH5=%u, CH6=%u, CH7=%u, CH8=%u, CH9=%u, CH10=%u, CH11=%u, CH12=%u, CH13=%u, CH14=%u, CH15=%u, CH16=%u",
-             channels[SBUS_CH_1],
-             channels[SBUS_CH_2],
-             channels[SBUS_CH_3],
-             channels[SBUS_CH_4],
-             channels[SBUS_CH_5],
-             channels[SBUS_CH_6],
-             channels[SBUS_CH_7],
-             channels[SBUS_CH_8],
-             channels[SBUS_CH_9],
-             channels[SBUS_CH_10],
-             channels[SBUS_CH_11],
-             channels[SBUS_CH_12],
-             channels[SBUS_CH_13],
-             channels[SBUS_CH_14],
-             channels[SBUS_CH_15],
-             channels[SBUS_CH_16]);
+    // ESP_LOGI(TAG,
+    //          "Channels: CH1=%u, CH2=%u, CH3=%u, CH4=%u, CH5=%u, CH6=%u, CH7=%u, CH8=%u, CH9=%u, CH10=%u, CH11=%u, CH12=%u, CH13=%u, CH14=%u, CH15=%u, CH16=%u",
+    //          channels[SBUS_CH_1],
+    //          channels[SBUS_CH_2],
+    //          channels[SBUS_CH_3],
+    //          channels[SBUS_CH_4],
+    //          channels[SBUS_CH_5],
+    //          channels[SBUS_CH_6],
+    //          channels[SBUS_CH_7],
+    //          channels[SBUS_CH_8],
+    //          channels[SBUS_CH_9],
+    //          channels[SBUS_CH_10],
+    //          channels[SBUS_CH_11],
+    //          channels[SBUS_CH_12],
+    //          channels[SBUS_CH_13],
+    //          channels[SBUS_CH_14],
+    //          channels[SBUS_CH_15],
+    //          channels[SBUS_CH_16]);
+    if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
 
     uint16_t roll_ctrl = sbus_to_0_1000(channels[SBUS_CH_1]);
 
@@ -354,7 +348,7 @@ void control_update_from_sbus(const uint16_t channels[16])
 
 void control_set_outputs(const ctrl_value_outputs_t *outputs)
 {
-    if (!s_initialized || outputs == NULL) return;
+    if (!s_ctrl_initialized || outputs == NULL) return;
 
     if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
 
@@ -379,7 +373,7 @@ void control_set_outputs(const ctrl_value_outputs_t *outputs)
 
 void control_get_outputs(ctrl_value_outputs_t *outputs)
 {
-    if (!s_initialized || outputs == NULL) return;
+    if (!s_ctrl_initialized || outputs == NULL) return;
 
     if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
     memcpy(outputs, &s_value_output, sizeof(ctrl_value_outputs_t));
@@ -388,7 +382,7 @@ void control_get_outputs(ctrl_value_outputs_t *outputs)
 
 void control_arm(void)
 {
-    if (!s_initialized) return;
+    if (!s_ctrl_initialized) return;
 
     if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
 
@@ -411,7 +405,7 @@ void control_arm(void)
 
 void control_disarm(void)
 {
-    if (!s_initialized) return;
+    if (!s_ctrl_initialized) return;
 
     if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
 
@@ -428,7 +422,7 @@ void control_disarm(void)
 
 bool control_is_armed(void)
 {
-    if (!s_initialized || s_control_mutex == NULL) return false;
+    if (!s_ctrl_initialized || s_control_mutex == NULL) return false;
 
     bool armed = false;
     if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -440,7 +434,7 @@ bool control_is_armed(void)
 
 void control_failsafe(void)
 {
-    if (!s_initialized) return;
+    if (!s_ctrl_initialized) return;
 
     if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
 
@@ -456,7 +450,7 @@ void control_failsafe(void)
     s_value_output.dig_ch2_state = 1;
 
     apply_outputs_locked();
-    ESP_LOGW(TAG, "FAILSAFE activated");
+    // ESP_LOGW(TAG, "FAILSAFE activated");
 
     xSemaphoreGive(s_control_mutex);
 }
@@ -468,7 +462,7 @@ void control_set_sbus_queue(QueueHandle_t q)
 
 void control_deinit(void)
 {
-    if (!s_initialized) return;
+    if (!s_ctrl_initialized) return;
 
     if (s_control_mutex != NULL) {
         xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100));
@@ -481,7 +475,7 @@ void control_deinit(void)
     s_armed = false;
     s_failsafe_active = false;
     memset(&s_value_output, 0, sizeof(s_value_output));
-    s_initialized = false;
+    s_ctrl_initialized = false;
 
     // Stop PWM outputs: set duty 0
     for (int i = 0; i < 6; i++) {

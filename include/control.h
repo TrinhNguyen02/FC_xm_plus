@@ -180,6 +180,7 @@ typedef struct {
     
 } ctrl_value_outputs_t;
 
+void control_tmp(void);
 
 /**
  * @brief Set current output type (runtime)

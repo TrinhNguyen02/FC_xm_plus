@@ -42,37 +42,6 @@ static uint32_t s_loop_counter = 0;
  * - SBUS signal status
  * - Armed/disarmed state
  */
-static void monitor_task(void *arg)
-{
-    ESP_LOGI(TAG, "Monitor task started");
-    
-    while (1) {
-        // Log system status every 10 seconds
-        vTaskDelay(pdMS_TO_TICKS(10000));
-        
-        // Get free heap memory
-        uint32_t free_heap = esp_get_free_heap_size();
-        
-        // Get SBUS status
-        bool sbus_valid = xm_plus_is_valid();
-        bool sbus_failsafe = xm_plus_is_failsafe();
-        bool armed = control_is_armed();
-        
-        // Log status
-        ESP_LOGI(TAG, "Heap: %lu | SBUS: %s | Failsafe: %s | Armed: %s | Loop: %lu | Stack: %d",
-                 free_heap, 
-                 sbus_valid ? "OK" : "LOST",
-                 sbus_failsafe ? "ACTIVE" : "OK",
-                 armed ? "YES" : "NO",
-                 s_loop_counter,
-                 uxTaskGetStackHighWaterMark(NULL));
-        
-        // Check for low memory warning
-        if (free_heap < 10000) {
-            ESP_LOGW(TAG, "Low memory: %lu bytes free", free_heap);
-        }
-    }
-}
 
 /**
  * @brief Initialize non-volatile storage (NVS)
@@ -126,7 +95,6 @@ void app_main(void)
     }
     
     // Initialize XM+ SBUS receiver
-
     ESP_LOGI(TAG, "Initializing XM+ SBUS receiver...");
     if (!xm_plus_init()) {
         ESP_LOGE(TAG, "Failed to initialize XM+ receiver!");
@@ -140,8 +108,11 @@ void app_main(void)
     s_system_running = true;
     
     // Create message queue for decoded SBUS data.
-    // Overwrite semantics: keep latest frame.
-    QueueHandle_t sbus_queue = xQueueCreate(1, sizeof(xm_plus_data_t));
+    // Mode: keep ALL frames (no overwrite). Queue size should be large enough to avoid drop.
+    // NOTE: If control_task can't keep up, FreeRTOS will block xQueueSend (we use short block time).
+    enum { SBUS_QUEUE_LENGTH = 32 };
+    QueueHandle_t sbus_queue = xQueueCreate(SBUS_QUEUE_LENGTH, sizeof(xm_plus_data_t));
+
     if (sbus_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create SBUS queue");
     } else {
@@ -155,14 +126,14 @@ void app_main(void)
         xm_plus_data_t xm_data;
         xm_plus_get_data(&xm_data);
 
-        // Push into queue (overwrite semantics with queue length=1).
+        // Send to control task via queue (non-blocking, short timeout)
         if (sbus_queue != NULL) {
-            // If queue is full, remove older item.
-            xQueueOverwrite(sbus_queue, &xm_data);
+            if (xQueueSend(sbus_queue, &xm_data, pdMS_TO_TICKS(5)) != pdTRUE) {
+                ESP_LOGW(TAG, "SBUS queue full, dropping frame");
+            }
         }
-
-        vTaskDelay(pdMS_TO_TICKS(2));
+        control_tmp();
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
-
 }
 
