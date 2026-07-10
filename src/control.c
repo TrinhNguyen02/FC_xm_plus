@@ -1,45 +1,48 @@
 /**
  * @file control.c
- * @brief Flight Control Output Implementation for ESP32-C3 Flight Controller
+ * @brief Flight Control Output — PWM and GPIO for ESP32-C3 Flight Controller
  *
- * Refactored to match include/control.h / include/config.h.
- * - SG90/servo: outputs via LEDC PWM (50Hz)
- * - DSHOT300/600: SAFE STUB (does not generate DSHOT waveform). Throttle is cut.
+ * Consumes ctrl_value_input_t from the algorithm queue and drives:
+ *   - 4 servo/ESC PWM channels via ESP32-C3 LEDC peripheral
+ *   - 2 auxiliary PWM channels
+ *   - 2 digital GPIO outputs (LEDs, buzzers, etc.)
+ *
+ * Arm/disarm logic:
+ *   - CH5 (aux1) < 600  → arm switch ready (low position)
+ *   - CH5 (aux1) ≥ 900  → arm, only if throttle = 0 and switch was previously low
+ *   - Failsafe or disarm → throttle cut immediately
  */
 
 #include "control.h"
 #include "config.h"
 #include "xm_plus.h"
-
 #include <string.h>
-
 #include "driver/ledc.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
-
+#include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 
+/*================ Static Variables =================*/
 
 static const char *TAG = "control";
 
-// Static state for control system
-static ctrl_value_outputs_t s_value_output = {0};
+static ctrl_value_output_t s_value_output = {0};
+// static ctrl_value_input_t  s_value_input  = {0};
 
-static SemaphoreHandle_t    s_control_mutex = NULL;
-static TaskHandle_t         s_ctrl_task_handle = NULL;
-static bool s_armed = false;
-static bool s_failsafe_active = false;
+static SemaphoreHandle_t s_control_mutex  = NULL;
+static TaskHandle_t      s_ctrl_task_handle = NULL;
+static QueueHandle_t     s_ctrl_queue     = NULL;
 
+static bool s_armed            = false;
+static bool s_arm_switch_ready = false;
+static bool s_failsafe_active  = false;
 static bool s_ctrl_initialized = false;
 
-// Queue for decoded SBUS data (from xm_plus_task/main)
-static QueueHandle_t s_sbus_queue = NULL;
-
-// Called by main.c to provide the decoded SBUS queue.
-void control_set_sbus_queue(QueueHandle_t q);
-
+/*================ Helper Functions =================*/
 
 static void set_pwm_duty(ledc_channel_t ch, uint32_t duty)
 {
@@ -49,457 +52,306 @@ static void set_pwm_duty(ledc_channel_t ch, uint32_t duty)
 
 static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
 {
-    if (v < lo) return lo;
-    if (v > hi) return hi;
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
     return v;
 }
 
 static uint16_t clamp_u16(uint16_t v, uint16_t lo, uint16_t hi)
 {
-    if (v < lo) return lo;
-    if (v > hi) return hi;
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
     return v;
 }
 
-// SBUS (172..1811) -> 0..1000
-static uint16_t sbus_to_0_1000(uint16_t sbus_value)
-{
-    const uint16_t sbus_min = SBUS_VALUE_MIN;
-    const uint16_t sbus_max = SBUS_VALUE_MAX;
-    sbus_value = clamp_u16(sbus_value, sbus_min, sbus_max);
-    return (uint16_t)(((uint32_t)(sbus_value - sbus_min) * 1000U) / (uint32_t)(sbus_max - sbus_min));
-}
+// static uint16_t ctrl_to_0_1000(uint16_t ctrl_value)
+// {
+//     const uint16_t ctrl_min = CTRL_VALUE_MIN;
+//     const uint16_t ctrl_max = CTRL_VALUE_MAX;
+//     ctrl_value = clamp_u16(ctrl_value, ctrl_min, ctrl_max);
+//     return (uint16_t)(((uint32_t)(ctrl_value - ctrl_min) * 1000U) / (uint32_t)(ctrl_max - ctrl_min));
+// }
 
-// Map servo pulse us [SG90_PWM_MIN_US..SG90_PWM_MAX_US] from control units [0..1000] where center=500
-// We interpret:
 static uint16_t ctrl_to_servo_us(uint16_t ctrl_0_1000)
 {
-    // ctrl_0_1000 clamped to 0..1000
     uint16_t c = clamp_u16(ctrl_0_1000, 0, 1000);
     return (uint16_t)(((uint32_t)c * (SG90_PWM_MAX_US - SG90_PWM_MIN_US)) / 1000U + SG90_PWM_MIN_US);
 }
 
 static uint32_t servo_us_to_duty(uint16_t us)
 {
-    // LEDC timer is configured for SG90_PWM_FREQ_HZ and PWM_RESOLUTION_BITS.
     const uint32_t period_us = 1000000U / SG90_PWM_FREQ_HZ;
-    const uint32_t duty = ((uint32_t)us * ((1U << SG90_PWM_RESOLUTION_BITS) - 1U)) / period_us;
-    const uint32_t max_duty = (1U << SG90_PWM_RESOLUTION_BITS) - 1U;
+    const uint32_t duty      = ((uint32_t)us * ((1U << SG90_PWM_RESOLUTION_BITS) - 1U)) / period_us;
+    const uint32_t max_duty  = (1U << SG90_PWM_RESOLUTION_BITS) - 1U;
     return clamp_u32(duty, 0, max_duty);
 }
 
+/*================ Arm / Disarm Logic =================*/
+/* Must be called with s_control_mutex held */
+
 static void apply_outputs_locked(void)
 {
-    // If disarmed OR failsafe OR output type is DSHOT => cut throttle.
-    if (s_value_output.dig_ch1_state >= 1000) {
+    /* Arm switch low → mark switch as ready; disarm if currently armed */
+    if (s_value_output.dig_ch3_state <= 600)
+    {
+        s_arm_switch_ready = true;
+
+        if (s_armed)
+        {
+            ESP_LOGI(TAG, "DISARMED");
+            s_armed = false;
+        }
+    }
+    else if (s_arm_switch_ready &&
+             !s_armed &&
+             s_value_output.dig_ch3_state >= 900 &&
+             s_value_output.pwm_ch1_us == 0)
+    {
+        /* Arm: switch high + throttle at zero + switch was previously low */
+        ESP_LOGI(TAG, "ARMED");
         s_armed = true;
-    } else {
-        s_armed = false;
     }
 
     bool cut_throttle = (!s_armed) || s_failsafe_active;
 
-    uint16_t throttle_ctrl = cut_throttle ? 0 : clamp_u16(s_value_output.pwm_ch1_us, 0, 1000);
-    uint16_t roll_ctrl_u = clamp_u16(s_value_output.pwm_ch2_us, 0, 1000);
-    uint16_t pitch_ctrl_u = clamp_u16(s_value_output.pwm_ch3_us, 0, 1000);
-    uint16_t yaw_ctrl_u = clamp_u16(s_value_output.pwm_ch4_us, 0, 1000);
+    uint16_t throttle_ctrl = cut_throttle ? 0 : s_value_output.pwm_ch1_us;
+    uint16_t roll_ctrl_u   = s_value_output.pwm_ch2_us;
+    uint16_t pitch_ctrl_u  = s_value_output.pwm_ch3_us;
+    uint16_t yaw_ctrl_u    = s_value_output.pwm_ch4_us;
 
-    // Convert to servo pulse widths
-    uint16_t throttle_us = ctrl_to_servo_us(throttle_ctrl);
-    uint16_t roll_us = ctrl_to_servo_us(roll_ctrl_u);
-    uint16_t pitch_us = ctrl_to_servo_us(pitch_ctrl_u);
-    uint16_t yaw_us = ctrl_to_servo_us(yaw_ctrl_u);
-    uint16_t aux1_us = ctrl_to_servo_us(clamp_u16(s_value_output.pwm_ch5_us, 0, 1000));
-    uint16_t aux2_us = ctrl_to_servo_us(clamp_u16(s_value_output.pwm_ch6_us, 0, 1000));
+    set_pwm_duty((ledc_channel_t)TIM_CH_1, servo_us_to_duty(ctrl_to_servo_us(throttle_ctrl)));
+    set_pwm_duty((ledc_channel_t)TIM_CH_2, servo_us_to_duty(ctrl_to_servo_us(roll_ctrl_u)));
+    set_pwm_duty((ledc_channel_t)TIM_CH_3, servo_us_to_duty(ctrl_to_servo_us(pitch_ctrl_u)));
+    set_pwm_duty((ledc_channel_t)TIM_CH_4, servo_us_to_duty(ctrl_to_servo_us(yaw_ctrl_u)));
 
-    // Set LEDC duties
-    set_pwm_duty((ledc_channel_t)TIM_CH_1, servo_us_to_duty(throttle_us));
-    set_pwm_duty((ledc_channel_t)TIM_CH_2, servo_us_to_duty(roll_us));
-    set_pwm_duty((ledc_channel_t)TIM_CH_3, servo_us_to_duty(pitch_us));
-    set_pwm_duty((ledc_channel_t)TIM_CH_4, servo_us_to_duty(yaw_us));
+    set_pwm_duty((ledc_channel_t)TIM_CH_5, servo_us_to_duty(ctrl_to_servo_us(clamp_u16(s_value_output.pwm_ch5_us, 0, 1000))));
+    set_pwm_duty((ledc_channel_t)TIM_CH_6, servo_us_to_duty(ctrl_to_servo_us(clamp_u16(s_value_output.pwm_ch6_us, 0, 1000))));
 
-    // AUX PWM channels (optional)
-    set_pwm_duty((ledc_channel_t)TIM_CH_5, servo_us_to_duty(aux1_us));
-    set_pwm_duty((ledc_channel_t)TIM_CH_6, servo_us_to_duty(aux2_us));
-
-    // Digital outputs (LEDs): dig_ch1_state/dig_ch2_state -> PIN_OUTPUT_1/2
     gpio_set_level(PIN_OUTPUT_1, s_value_output.dig_ch1_state ? 1 : 0);
     gpio_set_level(PIN_OUTPUT_2, s_value_output.dig_ch2_state ? 1 : 0);
 }
 
+/*================ Control Task =================*/
+
 static void control_task(void *arg)
 {
-    (void)arg;
-    xm_plus_data_t xm_data;
+    ESP_LOGI(TAG, "Control task started");
 
-    ESP_LOGI(TAG, "control_task started");
-
-    // Queue/Frame rate statistics
-    uint32_t frames_ok = 0;
-    uint32_t frames_total = 0;
-    uint32_t invalid_frames = 0;
+    ctrl_value_input_t ctrl_data;
+    uint32_t frames_total    = 0;
     uint32_t last_stats_time = xTaskGetTickCount();
-
-    // Limit stats/log interval
     const TickType_t stats_interval_ticks = pdMS_TO_TICKS(SBUS_STATUS_INTERVAL_MS);
 
-    while (1) {
-        if (s_sbus_queue != NULL) {
-            // Non-blocking-ish receive with small timeout
-            if (xQueueReceive(s_sbus_queue, &xm_data, pdMS_TO_TICKS(1)) == pdTRUE) {
+    while (1)
+    {
+        if (s_ctrl_queue != NULL)
+        {
+            if (xQueueReceive(s_ctrl_queue, &ctrl_data, pdMS_TO_TICKS(1)) == pdTRUE)
+            {
                 frames_total++;
-
-                if (xm_data.data_valid) {
-                    frames_ok++;
-                    control_update_from_sbus(xm_data.channels);
-                } else {
-                    invalid_frames++;
-                    control_failsafe();
-                }
+                control_update_from_alg(&ctrl_data);
             }
-        } else {
-            // If queue wasn't provided, just periodically apply current output state
-            if (s_control_mutex != NULL && xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        }
+        else
+        {
+            /* Fallback: apply last known outputs if no queue is connected */
+            if (s_control_mutex != NULL && xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(20)) == pdTRUE)
+            {
                 apply_outputs_locked();
                 xSemaphoreGive(s_control_mutex);
             }
         }
 
-        // Periodic FPS based on received frames from queue
         uint32_t now = xTaskGetTickCount();
-        if ((now - last_stats_time) >= stats_interval_ticks) {
-            uint32_t elapsed_ticks = now - last_stats_time;
-            uint32_t elapsed_ms = (elapsed_ticks * portTICK_PERIOD_MS);
+
+        if ((now - last_stats_time) >= stats_interval_ticks)
+        {
+            uint32_t elapsed_ms = (now - last_stats_time) * portTICK_PERIOD_MS;
             float fps = (elapsed_ms > 0) ? ((float)frames_total * 1000.0f / (float)elapsed_ms) : 0.0f;
 
-            ESP_LOGI(TAG, "SBUS queue stats: total=%lu ok=%lu invalid=%lu freq=%.1f fps",
-                     (unsigned long)frames_total,
-                     (unsigned long)frames_ok,
-                     (unsigned long)invalid_frames,
-                     fps);
+            // ESP_LOGI(TAG, "Freq=%.1f fps", fps);
 
-            frames_ok = 0;
-            frames_total = 0;
-            invalid_frames = 0;
-            last_stats_time = now;
+            frames_total     = 0;
+            last_stats_time  = now;
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-
 }
 
+/*================ Initialization / Deinitialization =================*/
 
 bool control_init(void)
 {
-    if (s_ctrl_initialized) {
-        ESP_LOGW(TAG, "Already initialized");
+    ESP_LOGI(TAG, "Initializing control system...");
+    if (s_ctrl_initialized)
+    {
         return true;
     }
 
     s_control_mutex = xSemaphoreCreateMutex();
-    if (s_control_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create mutex");
+
+    if (s_control_mutex == NULL)
+    {
         return false;
     }
 
+    /* Configure LEDC timer if any output is servo type */
     bool need_ledc_timer = false;
-    for (int i = 0; i < CONTROL_MAX_OUTPUTS; i++) {
-        if (BOARD_OUTPUT_MAP[i].type == CFG_OUTPUT_TYPE_SERVO) {
+
+    for (int i = 0; i < CONTROL_MAX_OUTPUTS; i++)
+    {
+        if (BOARD_OUTPUT_MAP[i].type == CFG_OUTPUT_TYPE_SERVO)
+        {
             need_ledc_timer = true;
             break;
         }
     }
 
-    if (need_ledc_timer) {
+    if (need_ledc_timer)
+    {
         ledc_timer_config_t timer_conf = {
             .duty_resolution = SG90_PWM_RESOLUTION_BITS,
-            .freq_hz = SG90_PWM_FREQ_HZ,
-            .speed_mode = LEDC_LOW_SPEED_MODE,
-            .timer_num = LEDC_TIMER_0,
-            .clk_cfg = LEDC_AUTO_CLK
+            .freq_hz         = SG90_PWM_FREQ_HZ,
+            .speed_mode      = LEDC_LOW_SPEED_MODE,
+            .timer_num       = LEDC_TIMER_0,
+            .clk_cfg         = LEDC_AUTO_CLK
         };
-        if (ledc_timer_config(&timer_conf) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to init LEDC Timer");
+
+        if (ledc_timer_config(&timer_conf) != ESP_OK)
+        {
             return false;
         }
     }
 
-    
+    /* Assign LEDC channels to servo outputs */
     uint8_t ledc_ch_counter = 0;
-    
-    for (int i = 0; i < CONTROL_MAX_OUTPUTS; i++) {
+
+    for (int i = 0; i < CONTROL_MAX_OUTPUTS; i++)
+    {
         cfg_hw_output_t cfg = BOARD_OUTPUT_MAP[i];
-        
-        if (cfg.type == CFG_OUTPUT_TYPE_NONE) continue;
 
-        if (cfg.type == CFG_OUTPUT_TYPE_SERVO) {
+        if (cfg.type == CFG_OUTPUT_TYPE_SERVO)
+        {
             ledc_channel_config_t ch_conf = {
-                .channel = (ledc_channel_t)ledc_ch_counter++,
-                .duty = 0,
-                .gpio_num = cfg.gpio_num,
+                .channel    = (ledc_channel_t)ledc_ch_counter++,
+                .duty       = 0,
+                .gpio_num   = cfg.gpio_num,
                 .speed_mode = LEDC_LOW_SPEED_MODE,
-                .hpoint = 0,
-                .timer_sel = LEDC_TIMER_0
+                .hpoint     = 0,
+                .timer_sel  = LEDC_TIMER_0
             };
-            if (ledc_channel_config(&ch_conf) != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to init LEDC Channel on GPIO %d", cfg.gpio_num);
-                return false;
-            }
-            ESP_LOGI(TAG, "Channel %d: Initialized as SERVO on GPIO %d", i, cfg.gpio_num);
+            esp_err_t err = ledc_channel_config(&ch_conf);
 
-        } 
-        else if (cfg.type == CFG_OUTPUT_TYPE_DSHOT300) {
-            // Tobe implemented: DSHOT300 initialization (if needed)
-            ESP_LOGI(TAG, "Channel %d: Configured as DSHOT300 on GPIO %d (STUB)", i, cfg.gpio_num);
+            // ESP_LOGI(TAG, "LEDC ch=%d gpio=%d err=%s",
+            //          ch_conf.channel, ch_conf.gpio_num, esp_err_to_name(err));
         }
     }
 
-    // Configure digital outputs (LEDs)
+    /* Configure digital output pins */
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << PIN_OUTPUT_1) | (1ULL << PIN_OUTPUT_2),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
+        .mode         = GPIO_MODE_OUTPUT
     };
+    gpio_config(&io_conf);
 
-    esp_err_t err = gpio_config(&io_conf);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "gpio_config failed: %d", err);
+    ESP_LOGI(TAG, "Control system initialized successfully.");
+
+    if (xTaskCreate(control_task, "control_task", STACK_CONTROL, NULL,
+                    TASK_CONTROL_PRIORITY, &s_ctrl_task_handle) != pdPASS)
+    {
+        ESP_LOGE(TAG, "Failed to create control task");
         return false;
     }
-
-    // Safe initial state
-    s_value_output.pwm_ch1_us = 0;     // throttle ctrl -> 0
-    s_value_output.pwm_ch2_us = SG90_PWM_CENTER_US;   // roll center
-    s_value_output.pwm_ch3_us = SG90_PWM_CENTER_US;   // pitch center
-    s_value_output.pwm_ch4_us = SG90_PWM_CENTER_US;   // yaw center
-    s_value_output.pwm_ch5_us = 0;
-    s_value_output.pwm_ch6_us = 0;
-    s_value_output.dig_ch1_state = 0;
-    s_value_output.dig_ch2_state = 0;
-
-    s_armed = false;
-    s_failsafe_active = false;
-
-    if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        apply_outputs_locked();
-        xSemaphoreGive(s_control_mutex);
-    }
-    
-    // Create control task (consumer) to read latest SBUS frame from queue.
-    BaseType_t result = xTaskCreate(control_task, "control_task", TASK_CONTROL_STACK,
-                                     NULL, TASK_CONTROL_PRIORITY, &s_ctrl_task_handle);
-    if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create control_task");
-        return false;
-    }
-
 
     s_ctrl_initialized = true;
-    ESP_LOGI(TAG, "Control system initialized successfully");
     return true;
-}
-
-void control_update_from_sbus(const uint16_t channels[16])
-{
-    if (!s_ctrl_initialized || channels == NULL) return;
-
-
-    // If we were in failsafe lock, first valid frame should release it.
-    if (s_failsafe_active) {
-        s_failsafe_active = false;
-    }
-
-    // ESP_LOGI(TAG,
-    //          "Channels: CH1=%u, CH2=%u, CH3=%u, CH4=%u, CH5=%u, CH6=%u, CH7=%u, CH8=%u, CH9=%u, CH10=%u, CH11=%u, CH12=%u, CH13=%u, CH14=%u, CH15=%u, CH16=%u",
-    //          channels[SBUS_CH_1],
-    //          channels[SBUS_CH_2],
-    //          channels[SBUS_CH_3],
-    //          channels[SBUS_CH_4],
-    //          channels[SBUS_CH_5],
-    //          channels[SBUS_CH_6],
-    //          channels[SBUS_CH_7],
-    //          channels[SBUS_CH_8],
-    //          channels[SBUS_CH_9],
-    //          channels[SBUS_CH_10],
-    //          channels[SBUS_CH_11],
-    //          channels[SBUS_CH_12],
-    //          channels[SBUS_CH_13],
-    //          channels[SBUS_CH_14],
-    //          channels[SBUS_CH_15],
-    //          channels[SBUS_CH_16]);
-    if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-
-    uint16_t roll_ctrl = sbus_to_0_1000(channels[SBUS_CH_1]);
-
-    uint16_t pitch_ctrl = sbus_to_0_1000(channels[SBUS_CH_2]);
-    uint16_t throttle_ctrl = sbus_to_0_1000(channels[SBUS_CH_3]);
-    uint16_t yaw_ctrl = sbus_to_0_1000(channels[SBUS_CH_4]);
-
-    s_value_output.pwm_ch1_us = throttle_ctrl; // throttle
-    s_value_output.pwm_ch2_us = roll_ctrl;
-    s_value_output.pwm_ch3_us = pitch_ctrl;
-    s_value_output.pwm_ch4_us = yaw_ctrl;
-
-    // AUX PWM (optional): store AUX CTRL scaled to 0..1000
-    s_value_output.pwm_ch5_us = sbus_to_0_1000(channels[SBUS_CH_7]);
-    s_value_output.pwm_ch6_us = sbus_to_0_1000(channels[SBUS_CH_8]);
-
-    // AUX -> digital states
-    s_value_output.dig_ch1_state = (channels[SBUS_CH_5]);
-    s_value_output.dig_ch2_state = (channels[SBUS_CH_6]);
-    s_value_output.dig_ch3_state = (channels[SBUS_CH_9]);
-    s_value_output.dig_ch4_state = (channels[SBUS_CH_10]);
-    s_value_output.dig_ch5_state = (channels[SBUS_CH_11]);
-    s_value_output.dig_ch6_state = (channels[SBUS_CH_12]);
-    // s_value_output.dig_ch7_state = (channels[SBUS_CH_13]);
-    // s_value_output.dig_ch8_state = (channels[SBUS_CH_14]);
-    apply_outputs_locked();
-
-    xSemaphoreGive(s_control_mutex);
-}
-
-void control_set_outputs(const ctrl_value_outputs_t *outputs)
-{
-    if (!s_ctrl_initialized || outputs == NULL) return;
-
-    if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-
-    s_value_output = *outputs;
-
-    // Clamp safety
-    s_value_output.pwm_ch1_us = clamp_u16(s_value_output.pwm_ch1_us, 0, 1000);
-    s_value_output.pwm_ch2_us = clamp_u16(s_value_output.pwm_ch2_us, 0, 1000);
-    s_value_output.pwm_ch3_us = clamp_u16(s_value_output.pwm_ch3_us, 0, 1000);
-    s_value_output.pwm_ch4_us = clamp_u16(s_value_output.pwm_ch4_us, 0, 1000);
-    s_value_output.pwm_ch5_us = clamp_u16(s_value_output.pwm_ch5_us, 0, 1000);
-    s_value_output.pwm_ch6_us = clamp_u16(s_value_output.pwm_ch6_us, 0, 1000);
-    s_value_output.dig_ch1_state = outputs->dig_ch1_state ? 1 : 0;
-    s_value_output.dig_ch2_state = outputs->dig_ch2_state ? 1 : 0;
-
-    // If disarmed or failsafe active, enforce throttle cut in apply stage.
-
-    apply_outputs_locked();
-
-    xSemaphoreGive(s_control_mutex);
-}
-
-void control_get_outputs(ctrl_value_outputs_t *outputs)
-{
-    if (!s_ctrl_initialized || outputs == NULL) return;
-
-    if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-    memcpy(outputs, &s_value_output, sizeof(ctrl_value_outputs_t));
-    xSemaphoreGive(s_control_mutex);
-}
-
-void control_arm(void)
-{
-    if (!s_ctrl_initialized) return;
-
-    if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-
-    if (!s_armed) {
-        s_armed = true;
-        s_failsafe_active = false;
-
-        // Keep centers
-        s_value_output.pwm_ch2_us = 500;
-        s_value_output.pwm_ch3_us = 500;
-        s_value_output.pwm_ch4_us = 500;
-        s_value_output.pwm_ch1_us = 0;
-
-        apply_outputs_locked();
-        ESP_LOGI(TAG, "System ARMED");
-    }
-
-    xSemaphoreGive(s_control_mutex);
-}
-
-void control_disarm(void)
-{
-    if (!s_ctrl_initialized) return;
-
-    if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-
-    if (s_armed) {
-        s_armed = false;
-        // throttle cut in apply stage
-        s_value_output.pwm_ch1_us = 0;
-        apply_outputs_locked();
-        ESP_LOGI(TAG, "System DISARMED");
-    }
-
-    xSemaphoreGive(s_control_mutex);
-}
-
-bool control_is_armed(void)
-{
-    if (!s_ctrl_initialized || s_control_mutex == NULL) return false;
-
-    bool armed = false;
-    if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        armed = s_armed;
-        xSemaphoreGive(s_control_mutex);
-    }
-    return armed;
-}
-
-void control_failsafe(void)
-{
-    if (!s_ctrl_initialized) return;
-
-    if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
-
-    s_failsafe_active = true;
-    s_armed = false;
-
-    // Failsafe policy: cut throttle, center attitude, turn LEDs on.
-    s_value_output.pwm_ch1_us = 0;
-    s_value_output.pwm_ch2_us = 500;
-    s_value_output.pwm_ch3_us = 500;
-    s_value_output.pwm_ch4_us = 500;
-    s_value_output.dig_ch1_state = 1;
-    s_value_output.dig_ch2_state = 1;
-
-    apply_outputs_locked();
-    // ESP_LOGW(TAG, "FAILSAFE activated");
-
-    xSemaphoreGive(s_control_mutex);
-}
-
-void control_set_sbus_queue(QueueHandle_t q)
-{
-    s_sbus_queue = q;
 }
 
 void control_deinit(void)
 {
-    if (!s_ctrl_initialized) return;
-
-    if (s_control_mutex != NULL) {
-        xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100));
-        xSemaphoreGive(s_control_mutex);
+    if (s_control_mutex != NULL)
+    {
         vSemaphoreDelete(s_control_mutex);
         s_control_mutex = NULL;
     }
 
-    // Reset state
-    s_armed = false;
-    s_failsafe_active = false;
-    memset(&s_value_output, 0, sizeof(s_value_output));
     s_ctrl_initialized = false;
-
-    // Stop PWM outputs: set duty 0
-    for (int i = 0; i < 6; i++) {
-        set_pwm_duty((ledc_channel_t)i, 0);
-    }
-
-    gpio_set_level(PIN_OUTPUT_1, 0);
-    gpio_set_level(PIN_OUTPUT_2, 0);
-
-    ESP_LOGI(TAG, "Control system deinitialized");
 }
 
+/*================ Public API =================*/
+
+void control_set_input_queue(QueueHandle_t q)
+{
+    s_ctrl_queue = q;
+}
+
+void control_update_from_alg(const ctrl_value_input_t *channel)
+{
+    if (!s_ctrl_initialized || channel == NULL)
+    {
+        return;
+    }
+
+    if (s_failsafe_active)
+    {
+        s_failsafe_active = false;
+    }
+
+    if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        s_value_output.pwm_ch1_us = channel->throttle;
+        s_value_output.pwm_ch2_us = channel->roll;
+        s_value_output.pwm_ch3_us = channel->pitch;
+        s_value_output.pwm_ch4_us = channel->yaw;
+        s_value_output.pwm_ch5_us = channel->aux3;
+        s_value_output.pwm_ch6_us = channel->aux4;
+
+        s_value_output.dig_ch1_state = channel->aux2;
+        s_value_output.dig_ch2_state = channel->aux6;
+        s_value_output.dig_ch3_state = channel->aux1;
+
+        apply_outputs_locked();
+        xSemaphoreGive(s_control_mutex);
+    }
+}
+
+void control_arm(void)
+{
+    if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        if (!s_armed)
+        {
+            s_armed           = true;
+            s_failsafe_active = false;
+            apply_outputs_locked();
+        }
+        xSemaphoreGive(s_control_mutex);
+    }
+}
+
+void control_disarm(void)
+{
+    if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        s_armed = false;
+        apply_outputs_locked();
+        xSemaphoreGive(s_control_mutex);
+    }
+}
+
+void control_failsafe(void)
+{
+    if (xSemaphoreTake(s_control_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        s_failsafe_active = true;
+        s_armed           = false;
+        apply_outputs_locked();
+        xSemaphoreGive(s_control_mutex);
+    }
+}
+
+bool control_is_armed(void)
+{
+    return s_armed;
+}

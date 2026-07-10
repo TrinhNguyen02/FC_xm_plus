@@ -1,295 +1,461 @@
 /**
  * @file control.h
- * @brief Flight Control Output Interface for ESP32-C3 Flight Controller
- * 
- * This module handles PWM output control for:
- * - Main motor/throttle (ESC) via PWM
- * - Left servo (aileron/elevator) via PWM
- * - Right servo (aileron/elevator) via PWM
- * - LED outputs controlled by transmitter switches
- * 
- * Features:
- * - Uses ESP32-C3 LEDC peripheral for PWM generation
- * - Thread-safe control surface updates
- * - Failsafe handling (cuts motor, centers servos)
- * - Smooth control surface transitions
+ * @brief Flight control output interface.
+ *
+ * This module manages all actuator outputs of the Flight Controller,
+ * including:
+ *
+ *  - Servo PWM outputs
+ *  - ESC outputs
+ *  - Digital outputs
+ *  - Arming / disarming
+ *  - Failsafe handling
+ *  - Output mixing
  */
 
 #ifndef CONTROL_H
 #define CONTROL_H
 
-#include <stdint.h>
-#include <stdbool.h>
-#include "config.h"
-#include "xm_plus.h"
-#include "driver/gpio.h"
-#include "freertos/queue.h"
-
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// ============================================================================
-// SBUS Channel Mapping (FrSky/FLYSKY standard)
-// ============================================================================
-#define SBUS_CH_1              0   // Channel 1 (Aileron)
-#define SBUS_CH_2              1   // Channel 2 (Elevator)
-#define SBUS_CH_3              2   // Channel 3 (Throttle)
-#define SBUS_CH_4              3   // Channel 4 (Yaw)
-#define SBUS_CH_5              4   // Channel 5 (AUX1)
-#define SBUS_CH_6              5   // Channel 6 (AUX2)
-#define SBUS_CH_7              6   // Channel 7 (AUX3)
-#define SBUS_CH_8              7   // Channel 8 (AUX4)
-#define SBUS_CH_9              8   // Channel 9 (AUX5)
-#define SBUS_CH_10             9   // Channel 10 (AUX6)
-#define SBUS_CH_11             10  // Channel 11 (AUX7)
-#define SBUS_CH_12             11  // Channel 12 (AUX8)
-#define SBUS_CH_13             12  // Channel 13 (AUX9)
-#define SBUS_CH_14             13  // Channel 14 (AUX10)
-#define SBUS_CH_15             14  // Channel 15 (AUX11)
-#define SBUS_CH_16             15  // Channel 16 (AUX12)
+/*==============================================================================
+ * Includes
+ *============================================================================*/
 
-#define SBUS_VALUE_MIN            172
-#define SBUS_VALUE_MAX            1811
+#include <stdbool.h>
+#include <stdint.h>
 
-// ============================================================================
-// PWM Output Configuration for SG90 Servos
-// ============================================================================
-#define SG90_PWM_FREQ_HZ             50     // PWM frequency for ESC and servos
-#define SG90_PWM_MIN_US              500   // Minimum pulse width in microseconds
-#define SG90_PWM_MAX_US              2500   // Maximum pulse width in microseconds
-#define SG90_PWM_CENTER_US           1500   // Center pulse width in microseconds
-#define SG90_PWM_RESOLUTION_BITS     12     // PWM resolution in bits (for LED
+#include "driver/gpio.h"
 
-// ============================================================================
-// PWM Output Configuration for general ESC
-// ============================================================================
-#define ESC_PWM_FREQ_HZ             400    // PWM frequency for ESC (can be 50Hz for analog ESC or 300/600Hz for digital ESC)
-#define ESC_PWM_MIN_US              1000   // Minimum pulse width in microseconds 
-#define ESC_PWM_MAX_US              2000   // Maximum pulse width in microseconds
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
-// ============================================================================
-// PWM Output Configuration for DSHOT ESC (uses digital protocol, so timing is different)
-// ============================================================================
-#define DSHOT_PWM_FREQ_HZ           600    // Effective frequency for DSHOT signals (not actual PWM frequency)
-#define DSHOT_PWM_MIN_US            125    // Minimum pulse width for DSHOT (represents DSHOT command 0)
-#define DSHOT_PWM_MAX_US            250    // Maximum pulse width for DSHOT (represents DSHOT command 48)
-
-#define CONTROL_MAX_OUTPUTS           8       // Max number of outputs (4 PWM + 2 digital)
+#include "config.h"
+#include "xm_plus.h"
 
 
-// ============================================================================
-// PWM timer channel mapping
-// ============================================================================
-#define TIM_CH_1 0
-#define TIM_CH_2 1
-#define TIM_CH_3 2
-#define TIM_CH_4 3
-#define TIM_CH_5 4
-#define TIM_CH_6 5
+/*==============================================================================
+ * SBUS Channel Mapping
+ *============================================================================*/
 
-
-
-// ============================================================================
-// Configuration output structure
-// ============================================================================
 /**
- * @brief Output mode configuration
+ * @brief SBUS input channel indices.
  */
-typedef enum {
-    CFG_OUTPUT_TYPE_NONE,
+#define SBUS_CH_1                 0      /**< Roll      */
+#define SBUS_CH_2                 1      /**< Pitch     */
+#define SBUS_CH_3                 2      /**< Throttle  */
+#define SBUS_CH_4                 3      /**< Yaw       */
+#define SBUS_CH_5                 4      /**< AUX1      */
+#define SBUS_CH_6                 5      /**< AUX2      */
+#define SBUS_CH_7                 6      /**< AUX3      */
+#define SBUS_CH_8                 7      /**< AUX4      */
+#define SBUS_CH_9                 8      /**< AUX5      */
+#define SBUS_CH_10                9      /**< AUX6      */
+#define SBUS_CH_11                10     /**< AUX7      */
+#define SBUS_CH_12                11     /**< AUX8      */
+#define SBUS_CH_13                12     /**< AUX9      */
+#define SBUS_CH_14                13     /**< AUX10     */
+#define SBUS_CH_15                14     /**< AUX11     */
+#define SBUS_CH_16                15     /**< AUX12     */
+
+#define CTRL_VALUE_MIN            172
+#define CTRL_VALUE_MAX            1811
+
+
+/*==============================================================================
+ * Servo PWM Configuration
+ *============================================================================*/
+
+#define SG90_PWM_FREQ_HZ          50
+#define SG90_PWM_MIN_US           500
+#define SG90_PWM_MAX_US           2500
+#define SG90_PWM_CENTER_US        1500
+#define SG90_PWM_RESOLUTION_BITS  12
+
+
+/*==============================================================================
+ * ESC PWM Configuration
+ *============================================================================*/
+
+#define ESC_PWM_FREQ_HZ           400
+#define ESC_PWM_MIN_US            1000
+#define ESC_PWM_MAX_US            2000
+
+
+/*==============================================================================
+ * DSHOT Configuration
+ *============================================================================*/
+
+#define DSHOT_PWM_FREQ_HZ         600
+#define DSHOT_PWM_MIN_US          125
+#define DSHOT_PWM_MAX_US          250
+
+
+/*==============================================================================
+ * Output Configuration
+ *============================================================================*/
+
+#define CONTROL_MAX_OUTPUTS       8
+#define CONTROL_QUEUE_LENGTH      1
+
+
+/*==============================================================================
+ * Timer Channel Mapping
+ *============================================================================*/
+
+#define TIM_CH_1                  0
+#define TIM_CH_2                  1
+#define TIM_CH_3                  2
+#define TIM_CH_4                  3
+#define TIM_CH_5                  4
+#define TIM_CH_6                  5
+
+
+/*==============================================================================
+ * Type Definitions
+ *============================================================================*/
+
+/**
+ * @brief Supported output protocols.
+ */
+typedef enum
+{
+    CFG_OUTPUT_TYPE_NONE = 0,
     CFG_OUTPUT_TYPE_DIGITAL,
     CFG_OUTPUT_TYPE_SERVO,
     CFG_OUTPUT_TYPE_DSHOT300,
     CFG_OUTPUT_TYPE_DSHOT600
+
 } cfg_output_type_t;
 
+
 /**
- * @brief Output configuration structure
+ * @brief PWM configuration.
  */
-typedef struct {
-    uint32_t frequency_hz;  
+typedef struct
+{
+    uint32_t frequency_hz;
     uint32_t min_value;
     uint32_t max_value;
     uint32_t center_value;
     uint32_t resolution_bits;
+
 } cfg_pwm_output_t;
 
+
 /**
- * @brief Output hardware type configuration
+ * @brief Hardware output configuration.
  */
-typedef struct {
+typedef struct
+{
     uint8_t timer_channel;
+
     gpio_num_t gpio_num;
+
     cfg_output_type_t type;
+
     cfg_pwm_output_t pwm_config;
+
 } cfg_hw_output_t;
 
-static const cfg_pwm_output_t PWM_CONFIG_SERVO = {
-    .frequency_hz = SG90_PWM_FREQ_HZ,
-    .min_value = SG90_PWM_MIN_US,
-    .max_value = SG90_PWM_MAX_US,
-    .center_value = SG90_PWM_CENTER_US,
+
+/*==============================================================================
+ * Default PWM Configurations
+ *============================================================================*/
+
+static const cfg_pwm_output_t PWM_CONFIG_SERVO =
+{
+    .frequency_hz   = SG90_PWM_FREQ_HZ,
+    .min_value      = SG90_PWM_MIN_US,
+    .max_value      = SG90_PWM_MAX_US,
+    .center_value   = SG90_PWM_CENTER_US,
     .resolution_bits = SG90_PWM_RESOLUTION_BITS
 };
 
-static const cfg_hw_output_t BOARD_OUTPUT_MAP[CONTROL_MAX_OUTPUTS] = {
-    { .timer_channel = TIM_CH_1, .gpio_num = PIN_PWM_1,    .type = CFG_OUTPUT_TYPE_SERVO   , .pwm_config = PWM_CONFIG_SERVO },
-    { .timer_channel = TIM_CH_2, .gpio_num = PIN_PWM_2,    .type = CFG_OUTPUT_TYPE_SERVO   , .pwm_config = PWM_CONFIG_SERVO },
-    { .timer_channel = TIM_CH_3, .gpio_num = PIN_PWM_3,    .type = CFG_OUTPUT_TYPE_SERVO   , .pwm_config = PWM_CONFIG_SERVO },
-    { .timer_channel = TIM_CH_4, .gpio_num = PIN_PWM_4,    .type = CFG_OUTPUT_TYPE_SERVO   , .pwm_config = PWM_CONFIG_SERVO },
-    { .timer_channel = TIM_CH_5, .gpio_num = PIN_PWM_5,    .type = CFG_OUTPUT_TYPE_NONE     , .pwm_config = {0} },
-    { .timer_channel = TIM_CH_6, .gpio_num = PIN_PWM_6,    .type = CFG_OUTPUT_TYPE_NONE     , .pwm_config = {0} },
-    { .timer_channel = 0,        .gpio_num = PIN_OUTPUT_1, .type = CFG_OUTPUT_TYPE_DIGITAL  , .pwm_config = {0} },
-    { .timer_channel = 0,        .gpio_num = PIN_OUTPUT_2, .type = CFG_OUTPUT_TYPE_DIGITAL  , .pwm_config = {0} }
+/*==============================================================================
+ * Board Output Mapping
+ *============================================================================*/
+
+/**
+ * @brief Default servo PWM configuration.
+ */
+static const cfg_hw_output_t BOARD_OUTPUT_MAP[CONTROL_MAX_OUTPUTS] =
+{
+    {
+        .timer_channel = TIM_CH_1,
+        .gpio_num      = PIN_PWM_1,
+        .type          = CFG_OUTPUT_TYPE_SERVO,
+        .pwm_config    = PWM_CONFIG_SERVO
+    },
+    {
+        .timer_channel = TIM_CH_2,
+        .gpio_num      = PIN_PWM_2,
+        .type          = CFG_OUTPUT_TYPE_SERVO,
+        .pwm_config    = PWM_CONFIG_SERVO
+    },
+    {
+        .timer_channel = TIM_CH_3,
+        .gpio_num      = PIN_PWM_3,
+        .type          = CFG_OUTPUT_TYPE_SERVO,
+        .pwm_config    = PWM_CONFIG_SERVO
+    },
+    {
+        .timer_channel = TIM_CH_4,
+        .gpio_num      = PIN_PWM_4,
+        .type          = CFG_OUTPUT_TYPE_SERVO,
+        .pwm_config    = PWM_CONFIG_SERVO
+    },
+    {
+        .timer_channel = TIM_CH_5,
+        .gpio_num      = PIN_PWM_5,
+        .type          = CFG_OUTPUT_TYPE_NONE,
+        .pwm_config    = {0}
+    },
+    {
+        .timer_channel = TIM_CH_6,
+        .gpio_num      = PIN_PWM_6,
+        .type          = CFG_OUTPUT_TYPE_NONE,
+        .pwm_config    = {0}
+    },
+    {
+        .timer_channel = 0,
+        .gpio_num      = PIN_OUTPUT_1,
+        .type          = CFG_OUTPUT_TYPE_DIGITAL,
+        .pwm_config    = {0}
+    },
+    {
+        .timer_channel = 0,
+        .gpio_num      = PIN_OUTPUT_2,
+        .type          = CFG_OUTPUT_TYPE_DIGITAL,
+        .pwm_config    = {0}
+    }
 };
 
-// ============================================================================
-// Control structure definitions
-// ============================================================================
+
+/*==============================================================================
+ * Type Definitions
+ *============================================================================*/
+
 /**
- * @brief Control mode configuration
+ * @brief Actuator output values.
+ *
+ * This structure contains the commands generated by the flight control
+ * algorithm before they are sent to the hardware outputs.
+ *
+ * PWM outputs use pulse width in microseconds.
+ * Digital outputs use logical states (0 or 1).
  */
-typedef enum {
-    CONTROL_MODE_MANUAL,
-    CONTROL_MODE_STABILIZE,
-    CONTROL_MODE_ACRO,
-    CONTROL_MODE_ANGLE,
-} FC_control_mode_t;
+typedef struct
+{
+    /*---------------- PWM Outputs ----------------*/
+
+    uint16_t pwm_ch1_us;      /**< PWM Output 1 */
+    uint16_t pwm_ch2_us;      /**< PWM Output 2 */
+    uint16_t pwm_ch3_us;      /**< PWM Output 3 */
+    uint16_t pwm_ch4_us;      /**< PWM Output 4 */
+    uint16_t pwm_ch5_us;      /**< PWM Output 5 */
+    uint16_t pwm_ch6_us;      /**< PWM Output 6 */
+
+    /*-------------- Digital Outputs --------------*/
+
+    uint16_t dig_ch1_state;   /**< Digital Output 1 */
+    uint16_t dig_ch2_state;   /**< Digital Output 2 */
+    uint16_t dig_ch3_state;   /**< Reserved */
+    uint16_t dig_ch4_state;   /**< Reserved */
+    uint16_t dig_ch5_state;   /**< Reserved */
+    uint16_t dig_ch6_state;   /**< Reserved */
+    uint16_t dig_ch7_state;   /**< Reserved */
+    uint16_t dig_ch8_state;   /**< Reserved */
+
+} ctrl_value_output_t;
 
 
 /**
- * @brief Control surface data structure
+ * @brief Control commands received from the flight algorithm.
+ *
+ * Values are normalized from receiver inputs before being converted
+ * to actuator outputs.
  */
-typedef struct {
-    uint16_t pwm_ch1_us;   // Throttle PWM value (0-1000 us)
-    uint16_t pwm_ch2_us;   // Roll PWM value (0-1000 us, center=500)
-    uint16_t pwm_ch3_us;   // Pitch PWM value (0-1000 us, center=500)
-    uint16_t pwm_ch4_us;   // Yaw PWM value (0-1000 us, center=500)
-    uint16_t pwm_ch5_us;   // Auxiliary channel 1 (e.g. LED dimmer)
-    uint16_t pwm_ch6_us;   // Auxiliary channel 2 (e.g. LED dimmer)
-    uint16_t dig_ch1_state;   // Digital output state for channel 1 (e.g. LED)
-    uint16_t dig_ch2_state;   // Digital output state for channel 2 (e.g. LED)
-    uint16_t dig_ch3_state;   // Digital output state for channel 3 (future use)
-    uint16_t dig_ch4_state;   // Digital output state for channel 4 (future use)
-    uint16_t dig_ch5_state;   // Digital output state for channel 5 (future use)
-    uint16_t dig_ch6_state;   // Digital output state for channel 6 (future use)
-    uint16_t dig_ch7_state;   // Digital output state for channel 7 (future use)
-    uint16_t dig_ch8_state;   // Digital output state for channel 8 (future use)
-    
-} ctrl_value_outputs_t;
+typedef struct
+{
+    uint16_t throttle;
 
-void control_tmp(void);
+    uint16_t roll;
+    uint16_t pitch;
+    uint16_t yaw;
+
+    uint16_t aux1;
+    uint16_t aux2;
+    uint16_t aux3;
+    uint16_t aux4;
+    uint16_t aux5;
+    uint16_t aux6;
+    uint16_t aux7;
+    uint16_t aux8;
+    uint16_t aux9;
+    uint16_t aux10;
+
+} ctrl_value_input_t;
+
+/*==============================================================================
+ * Public API
+ *============================================================================*/
+
+/*------------------------------------------------------------------------------
+ * Initialization
+ *----------------------------------------------------------------------------*/
 
 /**
- * @brief Set current output type (runtime)
- * 
- * This selects which output mapping/config is used inside control.c.
- * @return true if accepted
- */
-bool control_set_output_type(cfg_output_type_t type);
-
-/**
- * @brief Initialize control system
- * 
- * Configures LEDC peripheral for PWM generation on motor and servo pins.
- * Configures GPIO pins for LED outputs.
- * Sets all outputs to safe initial state (motor off, servos centered, LEDs off).
- * 
- * @return true if initialization successful
+ * @brief Initialize the control output module.
+ *
+ * This function performs:
+ *  - GPIO initialization
+ *  - PWM peripheral initialization
+ *  - Output configuration
+ *  - Creation of the control task
+ *
+ * @return true if initialization succeeds.
+ * @return false otherwise.
  */
 bool control_init(void);
 
-/**
- * @brief Update control outputs from SBUS channel data
- * 
- * Maps SBUS channel values (172-1811) to PWM outputs:
- * - CH1 (Aileron) -> Left/Right servos (differential for aileron control)
- * - CH2 (Elevator) -> Left/Right servos (mixed for elevator control)
- * - CH3 (Throttle) -> Motor ESC
- * - CH4 (Rudder) -> Reserved for future use
- * - CH5 (AUX1) -> LED1 control
- * - CH6 (AUX2) -> LED2 control
- * 
- * @param channels Pointer to array of 16 SBUS channel values
- */
-// Legacy direct update (still present but main loop should use queue-based flow)
-void control_update_from_sbus(const uint16_t channels[16]);
 
 /**
- * @brief Set control outputs directly
- * 
- * Allows direct control of all outputs. Useful for autonomous flight modes.
- * 
- * @param outputs Pointer to control outputs structure
- */
-void control_set_outputs(const ctrl_value_outputs_t *outputs);
-
-/**
- * @brief Get current control output values
- * 
- * @param outputs Pointer to structure to receive current output values
- */
-void control_get_outputs(ctrl_value_outputs_t *outputs);
-
-/**
- * @brief Arm the flight controller
- * 
- * Enables motor output. Must be called before motor will respond to throttle.
- */
-void control_arm(void);
-
-/**
- * @brief Disarm the flight controller
- * 
- * Disables motor output immediately. Motor will not respond to throttle.
- */
-void control_disarm(void);
-
-/**
- * @brief Check if flight controller is armed
- * 
- * @return true if armed, false if disarmed
- */
-bool control_is_armed(void);
-
-/**
- * @brief Trigger failsafe behavior
- * 
- * Called when receiver loses signal or enters failsafe mode.
- * - Cuts motor to minimum
- * - Centers all servos
- * - Flashes LEDs as warning
- */
-void control_failsafe(void);
-
-/**
- * @brief Deinitialize control system
- * 
- * Stops PWM outputs and releases resources.
+ * @brief Deinitialize the control module.
+ *
+ * All outputs are disabled and allocated resources are released.
  */
 void control_deinit(void);
 
-// Provide a FreeRTOS queue handle that carries xm_plus_data_t from xm_plus_task.
-// control_task will consume from this queue.
-void control_set_sbus_queue(QueueHandle_t q);
+
+/*------------------------------------------------------------------------------
+ * Queue Interface
+ *----------------------------------------------------------------------------*/
+
+/**
+ * @brief Set the input queue for control commands.
+ *
+ * The algorithm module sends actuator commands through this queue.
+ *
+ * @param queue Queue handle.
+ */
+void control_set_input_queue(QueueHandle_t queue);
 
 
+/*------------------------------------------------------------------------------
+ * Output Control
+ *----------------------------------------------------------------------------*/
+
+/**
+ * @brief Apply actuator outputs.
+ *
+ * This function writes the specified output values to the configured
+ * PWM and digital output channels.
+ *
+ * @param output Pointer to the output structure.
+ */
+void control_update_from_alg(const ctrl_value_input_t *channel);
 
 
 /**
- * @brief Push latest decoded SBUS data into control queue.
+ * @brief Stop all actuator outputs.
  *
- * Safe to call from the RX/main side. Control task will consume
- * and apply outputs.
- *
- * @return true if enqueued successfully
+ * Servo outputs return to their neutral position and all digital outputs
+ * are cleared.
  */
+void control_stop_all_outputs(void);
+
+
+/*------------------------------------------------------------------------------
+ * Output State
+ *----------------------------------------------------------------------------*/
+
+/**
+ * @brief Enable actuator outputs.
+ *
+ * After enabling, PWM and digital outputs are allowed to update normally.
+ */
+void control_enable_output(void);
+
+
+/**
+ * @brief Disable actuator outputs.
+ *
+ * All outputs remain inactive until enabled again.
+ */
+void control_disable_output(void);
+
+
+/**
+ * @brief Check whether actuator outputs are enabled.
+ *
+ * @return true if outputs are enabled.
+ * @return false if outputs are disabled.
+ */
+bool control_is_output_enabled(void);
+
+
+/*------------------------------------------------------------------------------
+ * Arming State
+ *----------------------------------------------------------------------------*/
+
+/**
+ * @brief Arm the flight controller.
+ *
+ * When armed, throttle and control surface outputs are allowed
+ * to respond to control commands.
+ */
+void control_arm(void);
+
+
+/**
+ * @brief Disarm the flight controller.
+ *
+ * Motor outputs are immediately disabled.
+ */
+void control_disarm(void);
+
+
+/**
+ * @brief Check the current arming state.
+ *
+ * @return true if the controller is armed.
+ * @return false otherwise.
+ */
+bool control_is_armed(void);
+
+
+/*------------------------------------------------------------------------------
+ * Failsafe
+ *----------------------------------------------------------------------------*/
+
+/**
+ * @brief Enter failsafe mode.
+ *
+ * The control module immediately switches all outputs to their
+ * predefined failsafe values.
+ */
+void control_enter_failsafe(void);
+
+
+/**
+ * @brief Exit failsafe mode.
+ */
+void control_exit_failsafe(void);
+
+
+/**
+ * @brief Check whether failsafe mode is active.
+ *
+ * @return true if failsafe is active.
+ */
+bool control_is_failsafe(void);
 
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // CONTROL_H
+#endif /* CONTROL_H */

@@ -1,129 +1,255 @@
 /**
  * @file xm_plus.h
- * @brief XM+ SBUS Receiver Interface for ESP32-C3 Flight Controller
- * 
- * This module handles communication with the FrSky XM+ receiver via SBUS protocol.
- * SBUS uses inverted UART at 100000 baud, 8 data bits, even parity, 2 stop bits.
- * 
- * Features:
- * - Uses UART with hardware inversion support
- * - DMA-based reception for reliable data capture
- * - FreeRTOS task for continuous SBUS frame processing
- * - Thread-safe channel data access via mutex
+ * @brief FrSky XM+ SBUS receiver interface.
+ *
+ * This module implements the SBUS receiver driver for the ESP32-C3 Flight
+ * Controller. It is responsible for:
+ *
+ *  - UART initialization
+ *  - SBUS frame decoding
+ *  - Failsafe detection
+ *  - Channel value decoding
+ *  - Flight mode selection
+ *  - Thread-safe data access
  */
 
 #ifndef XM_PLUS_H
 #define XM_PLUS_H
 
-#include <stdint.h>
-#include <stdbool.h>
-#include "driver/uart.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-#include "freertos/queue.h"
-
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// SBUS protocol constants (matching BetaFlight)
-#define SBUS_FRAME_SIZE         25
-#define SBUS_HEADER_BYTE        0x0F
-#define SBUS_FOOTER_BYTE        0x00
-#define SBUS_FOOTER_2_BYTE      0x04
-#define SBUS_CHANNEL            16
+/*==============================================================================
+ * Includes
+ *============================================================================*/
 
-#define SBUS_QUEUE_LENGTH       1
-#define SBUS_READ_TIMEOUT_MS    1
+#include <stdbool.h>
+#include <stdint.h>
 
-#define SBUS_STATUS_INTERVAL_MS     5000            // Frame rate statistics interval
-#define SBUS_SIGNAL_LOST_TIMEOUT_MS 500
+#include "driver/uart.h"
 
-#define SBUS_CHANNEL_VALUE_MIN 100
-#define SBUS_CHANNEL_VALUE_MAX 2048
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+
+/*==============================================================================
+ * SBUS Configuration
+ *============================================================================*/
 
 /**
- * @brief SBUS channel data structure
- * 
- * Contains all 16 channels plus status flags from the SBUS frame.
- * Channel values range from 172 to 1811 (FrSky SBUS standard).
+ * @brief SBUS frame definitions.
  */
-typedef struct {
-    uint16_t channels[SBUS_CHANNEL];    ///< 16 SBUS channel values (172-1811)
-    uint8_t  flags;           ///< SBUS flags (failsafe, frame lost, ch17, ch18)
-    bool     data_valid;      ///< True if valid data has been received
-    uint32_t last_update;     ///< Tick count of last valid frame
-} xm_plus_data_t;
+#define SBUS_FRAME_SIZE                 25
 
-// Parser state machine states (BetaFlight style)
-typedef enum {
-    SBUS_SYNC,      // Looking for header byte
-    SBUS_DATA,      // Collecting frame data
-    SBUS_DONE       // Frame complete
+#define SBUS_HEADER_BYTE                0x0F
+#define SBUS_FOOTER_BYTE                0x00
+#define SBUS_FOOTER_2_BYTE              0x04
+
+#define SBUS_CHANNEL_COUNT              16
+
+/**
+ * @brief Queue configuration.
+ */
+#define SBUS_QUEUE_LENGTH               1
+
+/**
+ * @brief UART receive timeout.
+ */
+#define SBUS_READ_TIMEOUT_MS            1
+
+/**
+ * @brief Signal monitoring configuration.
+ */
+#define SBUS_STATUS_INTERVAL_MS         2000
+#define SBUS_SIGNAL_LOST_TIMEOUT_MS     500
+
+/**
+ * @brief Expected SBUS channel range.
+ */
+#define SBUS_CHANNEL_VALUE_MIN          100
+#define SBUS_CHANNEL_VALUE_MAX          2048
+
+
+/*==============================================================================
+ * Enumerations
+ *============================================================================*/
+
+/**
+ * @brief SBUS channel index.
+ */
+typedef enum
+{
+    SBUS_CH_1 = 0,      /**< Aileron */
+    SBUS_CH_2,          /**< Elevator */
+    SBUS_CH_3,          /**< Throttle */
+    SBUS_CH_4,          /**< Rudder */
+
+    SBUS_CH_5,          /**< AUX1 (ARM switch) */
+    SBUS_CH_6,          /**< AUX2 */
+    SBUS_CH_7,          /**< AUX3 */
+    SBUS_CH_8,          /**< AUX4 */
+
+    SBUS_CH_9,          /**< AUX5 */
+    SBUS_CH_10,         /**< AUX6 */
+    SBUS_CH_11,         /**< AUX7 */
+    SBUS_CH_12,         /**< AUX8 */
+
+    SBUS_CH_13,         /**< AUX9 */
+    SBUS_CH_14,         /**< AUX10 */
+    SBUS_CH_15,         /**< AUX11 */
+    SBUS_CH_16          /**< AUX12 */
+
+} sbus_channel_t;
+
+
+/**
+ * @brief SBUS parser state machine.
+ */
+typedef enum
+{
+    SBUS_SYNC,
+    SBUS_DATA,
+    SBUS_DONE
+
 } sbus_state_t;
 
+
 /**
- * @brief Initialize the XM+ SBUS receiver interface
- * 
- * Configures UART1 with inverted RX signal for SBUS communication.
- * Sets up DMA buffer for reliable reception and creates the SBUS
- * processing task.
- * 
- * @return true if initialization successful, false otherwise
+ * @brief Flight control mode.
+ */
+typedef enum
+{
+    CONTROL_MODE_ANGLE = 0,
+    CONTROL_MODE_HORIZON,
+    CONTROL_MODE_ACRO,
+    CONTROL_MODE_RTH,
+    CONTROL_MODE_WAYPOINT
+
+} flight_mode_t;
+
+
+/*==============================================================================
+ * Type Definitions
+ *============================================================================*/
+
+/**
+ * @brief Latest decoded SBUS frame.
+ */
+typedef struct
+{
+    /**
+     * @brief SBUS channel values.
+     */
+    uint16_t channels[SBUS_CHANNEL_COUNT];
+
+    /**
+     * @brief SBUS status flags.
+     */
+    uint8_t flags;
+
+    /**
+     * @brief Indicates whether valid data has been received.
+     */
+    bool data_valid;
+
+    /**
+     * @brief FreeRTOS tick count of the latest valid frame.
+     */
+    uint32_t last_update;
+
+} xm_plus_data_t;
+
+
+/*==============================================================================
+ * Public API
+ *============================================================================*/
+
+/**
+ * @brief Initialize the XM+ receiver.
+ *
+ * This function configures the UART peripheral, initializes the SBUS
+ * decoder and starts the receiver task.
+ *
+ * @return true if initialization succeeds.
+ * @return false otherwise.
  */
 bool xm_plus_init(void);
 
-/**
- * @brief Get the latest SBUS channel data (thread-safe)
- * 
- * Copies the most recent SBUS data to the provided structure.
- * This function is thread-safe and can be called from any task.
- * 
- * @param[out] data Pointer to structure to receive channel data
- */
-void xm_plus_get_data(xm_plus_data_t *data);
 
 /**
- * @brief Get a single channel value (thread-safe)
- * 
- * @param channel Channel index (0-15)
- * @param[out] value Pointer to receive channel value
- * @return true if channel is valid, false if no data received yet
- */
-bool xm_plus_get_channel(uint8_t channel, uint16_t *value);
-
-/**
- * @brief Check if SBUS signal is valid
- * 
- * @return true if valid SBUS frames are being received
- */
-bool xm_plus_is_valid(void);
-
-/**
- * @brief Check if receiver is in failsafe mode
- * 
- * @return true if failsafe is active (transmitter off or out of range)
- */
-bool xm_plus_is_failsafe(void);
-
-/**
- * @brief Get the SBUS flags byte
- * 
- * @param[out] flags Pointer to receive flags byte
- * @return true if data is valid
- */
-bool xm_plus_get_flags(uint8_t *flags);
-
-/**
- * @brief Deinitialize the XM+ interface
- * 
- * Stops the SBUS task and releases UART resources.
+ * @brief Deinitialize the receiver.
  */
 void xm_plus_deinit(void);
 
-// Provide a FreeRTOS queue handle that carries xm_plus_data_t from xm_plus_task.
-// The xm_plus task will overwrite the latest decoded SBUS frame into this queue.
+
+/**
+ * @brief Get the latest decoded SBUS frame.
+ *
+ * Thread-safe.
+ *
+ * @param[out] data Destination structure.
+ */
+void xm_plus_get_data(xm_plus_data_t *data);
+
+
+/**
+ * @brief Get one SBUS channel value.
+ *
+ * @param channel Channel index.
+ * @param[out] value Decoded channel value.
+ *
+ * @return true if valid data is available.
+ */
+bool xm_plus_get_channel(uint8_t channel,
+                         uint16_t *value);
+
+
+/**
+ * @brief Check whether the receiver signal is valid.
+ *
+ * @return true if valid SBUS frames are being received.
+ */
+bool xm_plus_is_valid(void);
+
+
+/**
+ * @brief Check receiver failsafe status.
+ *
+ * @return true if failsafe is active.
+ */
+bool xm_plus_is_failsafe(void);
+
+
+/**
+ * @brief Get the SBUS status flags.
+ *
+ * @param[out] flags SBUS flags.
+ *
+ * @return true if valid data is available.
+ */
+bool xm_plus_get_flags(uint8_t *flags);
+
+
+/**
+ * @brief Get the current flight control mode.
+ *
+ * The mode is decoded from the configured AUX channel.
+ *
+ * @return Current flight mode.
+ */
+flight_mode_t xm_plus_get_control_mode(void);
+
+
+/**
+ * @brief Set the output queue for decoded SBUS frames.
+ *
+ * The XM+ task writes the latest decoded frame into this queue using
+ * xQueueOverwrite().
+ *
+ * @param q Queue handle.
+ */
 void xm_plus_set_output_queue(QueueHandle_t q);
 
 
@@ -131,4 +257,4 @@ void xm_plus_set_output_queue(QueueHandle_t q);
 }
 #endif
 
-#endif // XM_PLUS_H
+#endif /* XM_PLUS_H */
