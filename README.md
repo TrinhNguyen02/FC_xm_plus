@@ -278,10 +278,6 @@ FC_xm_plus/
 ├── test/
 │
 └── tools/
-    ├── sbus_monitor.c
-    ├── sbus_monitor.exe
-    ├── build_monitor.bat
-    └── build_monitor.ps1
 ```
 
 ---
