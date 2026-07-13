@@ -292,7 +292,10 @@ void imu_task(void *pvParameters)
     ESP_LOGI(TAG, "IMU task started");
 
     uint64_t last_time = esp_timer_get_time();
+
+#ifdef DEBUG_FLAG
     uint32_t print_counter = 0;
+#endif
 
     sampleFreq = 1000.0f;
 
@@ -331,16 +334,17 @@ void imu_task(void *pvParameters)
         s_imu_euler_deg.roll  = atan2f(2.0f * (q0 * q1 + q2 * q3), 1.0f - 2.0f * (q1 * q1 + q2 * q2)) * RAD_TO_DEG;
         s_imu_euler_deg.pitch = asinf(2.0f * (q0 * q2 - q3 * q1)) * RAD_TO_DEG;
         s_imu_euler_deg.yaw   = atan2f(2.0f * (q0 * q3 + q1 * q2), 1.0f - 2.0f * (q2 * q2 + q3 * q3)) * RAD_TO_DEG;
- 
+
+#ifdef DEBUG_FLAG
         print_counter++;
         if (print_counter >= 2000)
         {
             ESP_LOGI(TAG, "Roll: %6.1f | Pitch: %6.1f | Yaw: %6.1f | Freq: %.1f Hz", 
                 s_imu_euler_deg.roll, s_imu_euler_deg.pitch, s_imu_euler_deg.yaw, sampleFreq);
-            // print_ram_usage();
+            print_ram_usage();
             print_counter = 0;
         }
-
+#endif
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }

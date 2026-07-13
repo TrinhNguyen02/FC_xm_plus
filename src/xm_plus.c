@@ -104,9 +104,11 @@ static void xm_plus_task(void *arg)
 {
     ESP_LOGI(TAG, "XM+ SBUS task started");
 
+#ifdef DEBUG_FLAG
     uint32_t frame_count      = 0;
     uint32_t invalid_count    = 0;
-    uint32_t last_stats_time  = xTaskGetTickCount();
+    uint32_t last_status_time  = xTaskGetTickCount();
+#endif
 
     while (1)
     {
@@ -133,7 +135,9 @@ static void xm_plus_task(void *arg)
                                 if (channels[c] < SBUS_CHANNEL_VALUE_MIN || channels[c] > SBUS_CHANNEL_VALUE_MAX)
                                 {
                                     valid = false;
+#ifdef DEBUG_FLAG
                                     invalid_count++;
+#endif
                                     break;
                                 }
                             }
@@ -147,8 +151,9 @@ static void xm_plus_task(void *arg)
                                     s_xm_data.data_valid  = true;
                                     s_xm_data.last_update = xTaskGetTickCount();
                                     xSemaphoreGive(s_xm_mutex);
+#ifdef DEBUG_FLAG
                                     frame_count++;
-
+#endif
                                     if (s_output_queue != NULL)
                                     {
                                         xQueueOverwrite(s_output_queue, &s_xm_data);
@@ -159,7 +164,9 @@ static void xm_plus_task(void *arg)
                     }
                     else
                     {
+#ifdef DEBUG_FLAG
                         invalid_count++;
+#endif
                         memset(s_frame, 0, sizeof(s_frame));
                     }
                 }
@@ -170,9 +177,10 @@ static void xm_plus_task(void *arg)
 
         uint32_t now = xTaskGetTickCount();
 
-        if (now - last_stats_time >= pdMS_TO_TICKS(SBUS_STATUS_INTERVAL_MS))
+#ifdef DEBUG_FLAG
+        if (now - last_status_time >= pdMS_TO_TICKS(SBUS_STATUS_INTERVAL_MS))
         {
-            uint32_t elapsed_ms = (now - last_stats_time) * portTICK_PERIOD_MS;
+            uint32_t elapsed_ms = (now - last_status_time) * portTICK_PERIOD_MS;
             float fps = (elapsed_ms > 0) ? ((float)frame_count * 1000.0f / (float)elapsed_ms) : 0.0f;
 
             ESP_LOGI(TAG, "Status: %lu frames, %lu invalid | Freq: %.1f fps",
@@ -180,9 +188,9 @@ static void xm_plus_task(void *arg)
 
             frame_count      = 0;
             invalid_count    = 0;
-            last_stats_time  = now;
+            last_status_time  = now;
         }
-
+#endif
         /* Invalidate data if no frame received within timeout */
         if (s_xm_data.data_valid)
         {

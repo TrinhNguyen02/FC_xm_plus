@@ -86,6 +86,20 @@ static uint32_t servo_us_to_duty(uint16_t us)
     return clamp_u32(duty, 0, max_duty);
 }
 
+static uint16_t ctrl_to_esc_us(uint16_t ctrl_0_1000)
+{
+    uint16_t c = clamp_u16(ctrl_0_1000, 0, 1000);
+    return (uint16_t)(((uint32_t)c * (ESC_PWM_MAX_US - ESC_PWM_MIN_US)) / 1000U + ESC_PWM_MIN_US);
+}
+
+static uint32_t esc_us_to_duty(uint16_t us)
+{
+    const uint32_t period_us = 1000000U / ESC_PWM_FREQ_HZ;
+    const uint32_t duty      = ((uint32_t)us * ((1U << ESC_PWM_RESOLUTION_BITS) - 1U)) / period_us;
+    const uint32_t max_duty  = (1U << ESC_PWM_RESOLUTION_BITS) - 1U;
+    return clamp_u32(duty, 0, max_duty);
+}
+
 /*================ Arm / Disarm Logic =================*/
 /* Must be called with s_control_mutex held */
 
@@ -119,7 +133,7 @@ static void apply_outputs_locked(void)
     uint16_t pitch_ctrl_u  = s_value_output.pwm_ch3_us;
     uint16_t yaw_ctrl_u    = s_value_output.pwm_ch4_us;
 
-    set_pwm_duty((ledc_channel_t)TIM_CH_1, servo_us_to_duty(ctrl_to_servo_us(throttle_ctrl)));
+    set_pwm_duty((ledc_channel_t)TIM_CH_1, esc_us_to_duty(ctrl_to_esc_us(throttle_ctrl)));
     set_pwm_duty((ledc_channel_t)TIM_CH_2, servo_us_to_duty(ctrl_to_servo_us(roll_ctrl_u)));
     set_pwm_duty((ledc_channel_t)TIM_CH_3, servo_us_to_duty(ctrl_to_servo_us(pitch_ctrl_u)));
     set_pwm_duty((ledc_channel_t)TIM_CH_4, servo_us_to_duty(ctrl_to_servo_us(yaw_ctrl_u)));
@@ -137,10 +151,12 @@ static void control_task(void *arg)
 {
     ESP_LOGI(TAG, "Control task started");
 
-    ctrl_value_input_t ctrl_data;
+#ifdef DEBUG_FLAG
     uint32_t frames_total    = 0;
-    uint32_t last_stats_time = xTaskGetTickCount();
-    const TickType_t stats_interval_ticks = pdMS_TO_TICKS(SBUS_STATUS_INTERVAL_MS);
+    uint32_t last_status_time = xTaskGetTickCount();
+    const TickType_t status_interval_ticks = pdMS_TO_TICKS(SBUS_STATUS_INTERVAL_MS);
+#endif
+    ctrl_value_input_t ctrl_data;
 
     while (1)
     {
@@ -148,7 +164,9 @@ static void control_task(void *arg)
         {
             if (xQueueReceive(s_ctrl_queue, &ctrl_data, pdMS_TO_TICKS(1)) == pdTRUE)
             {
+#ifdef DEBUG_FLAG
                 frames_total++;
+#endif
                 control_update_from_alg(&ctrl_data);
             }
         }
@@ -162,19 +180,19 @@ static void control_task(void *arg)
             }
         }
 
+#ifdef DEBUG_FLAG
         uint32_t now = xTaskGetTickCount();
-
-        if ((now - last_stats_time) >= stats_interval_ticks)
+        if ((now - last_status_time) >= status_interval_ticks)
         {
-            uint32_t elapsed_ms = (now - last_stats_time) * portTICK_PERIOD_MS;
+            uint32_t elapsed_ms = (now - last_status_time) * portTICK_PERIOD_MS;
             float fps = (elapsed_ms > 0) ? ((float)frames_total * 1000.0f / (float)elapsed_ms) : 0.0f;
 
-            // ESP_LOGI(TAG, "Freq=%.1f fps", fps);
+            ESP_LOGI(TAG, "Freq=%.1f fps", fps);
 
             frames_total     = 0;
-            last_stats_time  = now;
+            last_status_time  = now;
         }
-
+#endif
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -201,7 +219,7 @@ bool control_init(void)
 
     for (int i = 0; i < CONTROL_MAX_OUTPUTS; i++)
     {
-        if (BOARD_OUTPUT_MAP[i].type == CFG_OUTPUT_TYPE_SERVO)
+        if (BOARD_OUTPUT_MAP[i].type == CFG_OUTPUT_TYPE_SERVO || BOARD_OUTPUT_MAP[i].type == CFG_OUTPUT_TYPE_ESC_PWM)
         {
             need_ledc_timer = true;
             break;
@@ -211,8 +229,8 @@ bool control_init(void)
     if (need_ledc_timer)
     {
         ledc_timer_config_t timer_conf = {
-            .duty_resolution = SG90_PWM_RESOLUTION_BITS,
-            .freq_hz         = SG90_PWM_FREQ_HZ,
+            .duty_resolution = SG90_PWM_RESOLUTION_BITS, // ESC general is the same
+            .freq_hz         = SG90_PWM_FREQ_HZ,         // ESC general is the same
             .speed_mode      = LEDC_LOW_SPEED_MODE,
             .timer_num       = LEDC_TIMER_0,
             .clk_cfg         = LEDC_AUTO_CLK
@@ -231,7 +249,7 @@ bool control_init(void)
     {
         cfg_hw_output_t cfg = BOARD_OUTPUT_MAP[i];
 
-        if (cfg.type == CFG_OUTPUT_TYPE_SERVO)
+        if (cfg.type == CFG_OUTPUT_TYPE_SERVO || cfg.type == CFG_OUTPUT_TYPE_ESC_PWM)
         {
             ledc_channel_config_t ch_conf = {
                 .channel    = (ledc_channel_t)ledc_ch_counter++,
@@ -241,7 +259,7 @@ bool control_init(void)
                 .hpoint     = 0,
                 .timer_sel  = LEDC_TIMER_0
             };
-            esp_err_t err = ledc_channel_config(&ch_conf);
+            ledc_channel_config(&ch_conf);
 
             // ESP_LOGI(TAG, "LEDC ch=%d gpio=%d err=%s",
             //          ch_conf.channel, ch_conf.gpio_num, esp_err_to_name(err));

@@ -80,7 +80,7 @@ extern "C" {
 /**
  * @brief Horizon mode blending threshold.
  */
-#define HORIZON_THRESHOLD              0.7f
+#define HORIZON_THRESHOLD              0.5f
 
 /**
  * @brief Integral anti-windup limit.

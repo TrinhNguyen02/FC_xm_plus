@@ -125,8 +125,8 @@ static uint16_t pid_to_servo(float output, float range)
 /*================ Outer PID State =================*/
 /* Only accessed by outer task — no atomic needed */
 
-static fc_pid_t s_roll_outer  = { .Kp=4.0f, .Ki=0.0f, .Kd=0.0f, .integral=0, .prev_error=0, .integral_limit=INTEGRAL_LIMIT };
-static fc_pid_t s_pitch_outer = { .Kp=4.0f, .Ki=0.0f, .Kd=0.0f, .integral=0, .prev_error=0, .integral_limit=INTEGRAL_LIMIT };
+static fc_pid_t s_roll_outer  = { .Kp=4.0f, .Ki=0.01f, .Kd=0.0f, .integral=0, .prev_error=0, .integral_limit=INTEGRAL_LIMIT };
+static fc_pid_t s_pitch_outer = { .Kp=4.0f, .Ki=0.01f, .Kd=0.0f, .integral=0, .prev_error=0, .integral_limit=INTEGRAL_LIMIT };
 
 static void outer_reset_all(void)
 {
@@ -151,7 +151,7 @@ static void outer_run_angle(const uint16_t channels[16],
     float roll_rate  = pid_compute(&s_roll_outer,  roll_sp_deg,  roll_deg,  dt);
     float pitch_rate = pid_compute(&s_pitch_outer, pitch_sp_deg, pitch_deg, dt);
 
-    atomic_store(&s_flight_sp.roll_setpoint,  clamp_f(roll_rate,  -MAX_ROLL_RATE_DPS,  MAX_ROLL_RATE_DPS));
+    atomic_store(&s_flight_sp.roll_setpoint,  clamp_f(roll_rate,  -MAX_ROLL_RATE_DPS,  MAX_ROLL_RATE_DPS)); 
     atomic_store(&s_flight_sp.pitch_setpoint, clamp_f(pitch_rate, -MAX_PITCH_RATE_DPS, MAX_PITCH_RATE_DPS));
     atomic_store(&s_flight_sp.yaw_setpoint,   yaw_norm * MAX_YAW_RATE_DPS);
     atomic_store(&s_flight_sp.throttle,       clamp_f(thr_norm, 0.0f, 1.0f));
@@ -167,36 +167,22 @@ static void outer_run_horizon(const uint16_t channels[16],
     float thr_norm   = (sbus_to_norm(channels[SBUS_CH_3]) + 1.0f) / 2.0f;
 
     /* Roll blend: angle-mode when stick is small, rate-mode when stick is large */
-    float abs_roll = fabsf(roll_norm);
-    float roll_rate;
+    float roll_sp_deg = roll_norm * MAX_ROLL_ANGLE_DEG;
 
-    if (abs_roll <= HORIZON_THRESHOLD)
-    {
-        float roll_sp_deg = roll_norm * MAX_ROLL_ANGLE_DEG;
-        roll_rate = pid_compute(&s_roll_outer, roll_sp_deg, roll_deg, dt);
-    }
-    else
-    {
-        pid_reset(&s_roll_outer);   /* outer irrelevant at full stick deflection */
-        float t = (abs_roll - HORIZON_THRESHOLD) / (1.0f - HORIZON_THRESHOLD);
-        roll_rate = roll_norm * MAX_ROLL_RATE_DPS * t;
-    }
+    float angle_rate = pid_compute(&s_roll_outer, roll_sp_deg, roll_deg, dt);
+    float manual_rate = roll_norm * MAX_ROLL_RATE_DPS;
+    float blend = clamp_f((fabsf(roll_norm) - HORIZON_THRESHOLD) / (1.0f - HORIZON_THRESHOLD), 0.0f, 1.0f);
+
+    float roll_rate = (1.0f - blend) * angle_rate + blend * manual_rate;
 
     /* Pitch blend */
-    float abs_pitch = fabsf(pitch_norm);
-    float pitch_rate;
+    float pitch_sp_deg = pitch_norm * MAX_PITCH_ANGLE_DEG;
 
-    if (abs_pitch <= HORIZON_THRESHOLD)
-    {
-        float pitch_sp_deg = pitch_norm * MAX_PITCH_ANGLE_DEG;
-        pitch_rate = pid_compute(&s_pitch_outer, pitch_sp_deg, pitch_deg, dt);
-    }
-    else
-    {
-        pid_reset(&s_pitch_outer);
-        float t = (abs_pitch - HORIZON_THRESHOLD) / (1.0f - HORIZON_THRESHOLD);
-        pitch_rate = pitch_norm * MAX_PITCH_RATE_DPS * t;
-    }
+    angle_rate = pid_compute(&s_pitch_outer, pitch_sp_deg, pitch_deg, dt);
+    manual_rate = pitch_norm * MAX_ROLL_RATE_DPS;
+    blend = clamp_f((fabsf(pitch_norm) - HORIZON_THRESHOLD) / (1.0f - HORIZON_THRESHOLD), 0.0f, 1.0f);
+
+    float pitch_rate = (1.0f - blend) * angle_rate + blend * manual_rate;
 
     atomic_store(&s_flight_sp.roll_setpoint,  clamp_f(roll_rate,  -MAX_ROLL_RATE_DPS,  MAX_ROLL_RATE_DPS));
     atomic_store(&s_flight_sp.pitch_setpoint, clamp_f(pitch_rate, -MAX_PITCH_RATE_DPS, MAX_PITCH_RATE_DPS));
@@ -282,8 +268,10 @@ void alg_outer_task(void *pvParameters)
     xm_plus_data_t xm_data;
     memset(&xm_data, 0, sizeof(xm_data));
 
+#ifdef DEBUG_FLAG
+    uint32_t log_count = 0;
+#endif
     uint64_t last_us   = esp_timer_get_time();
-    // uint32_t log_count = 0;
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xFrequency = pdMS_TO_TICKS(OUTER_PERIOD_MS);
@@ -346,11 +334,11 @@ void alg_outer_task(void *pvParameters)
             switch (g_fc_control_mode)
             {
                 case CONTROL_MODE_ANGLE:
-                    outer_run_angle(xm_data.channels, roll_deg, pitch_deg, dt);
+                    outer_run_angle(xm_data.channels, -roll_deg, -pitch_deg, dt);   // negative is personal custom
                     break;
 
                 case CONTROL_MODE_HORIZON:
-                    outer_run_horizon(xm_data.channels, roll_deg, pitch_deg, dt);
+                    outer_run_horizon(xm_data.channels, -roll_deg, -pitch_deg, dt); // negative is personal custom
                     break;
 
                 case CONTROL_MODE_ACRO:
@@ -380,14 +368,15 @@ void alg_outer_task(void *pvParameters)
         }
 
         /* 6. Periodic log (disabled by default) */
-        // if (++log_count >= OUTER_HZ * 2) {
-        //     ESP_LOGI(TAG, "Outer | mode=%d roll=%.1f° pitch=%.1f° | rsp roll=%.1f pitch=%.1f",
-        //              (int)g_fc_control_mode, roll_deg, pitch_deg,
-        //              atomic_load(&s_flight_sp.roll_setpoint),
-        //              atomic_load(&s_flight_sp.pitch_setpoint));
-        //     log_count = 0;
-        // }
-
+#ifdef DEBUG_FLAG
+        if (++log_count >= OUTER_HZ * 2) {
+            ESP_LOGI(TAG, "Outer | mode=%d roll=%.1f° pitch=%.1f° | rsp roll=%.1f pitch=%.1f",
+                     (int)g_fc_control_mode, roll_deg, pitch_deg,
+                     atomic_load(&s_flight_sp.roll_setpoint),
+                     atomic_load(&s_flight_sp.pitch_setpoint));
+            log_count = 0;
+        }
+#endif
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
@@ -408,9 +397,9 @@ void alg_outer_task(void *pvParameters)
  */
 
 /* Inner PID state — only accessed by inner task, no atomic needed */
-static fc_pid_t s_roll_inner  = { .Kp=1.5f, .Ki=0.05f, .Kd=0.02f, .integral=0, .prev_error=0, .integral_limit=INTEGRAL_LIMIT };
-static fc_pid_t s_pitch_inner = { .Kp=1.5f, .Ki=0.05f, .Kd=0.02f, .integral=0, .prev_error=0, .integral_limit=INTEGRAL_LIMIT };
-static fc_pid_t s_yaw_inner   = { .Kp=1.0f, .Ki=0.02f, .Kd=0.01f, .integral=0, .prev_error=0, .integral_limit=INTEGRAL_LIMIT };
+static fc_pid_t s_roll_inner  = { .Kp=1.5f, .Ki=0.05f, .Kd=0, .integral=0, .prev_error=0, .integral_limit=INTEGRAL_LIMIT };
+static fc_pid_t s_pitch_inner = { .Kp=1.5f, .Ki=0.05f, .Kd=0, .integral=0, .prev_error=0, .integral_limit=INTEGRAL_LIMIT };
+static fc_pid_t s_yaw_inner   = { .Kp=1.0f, .Ki=0.02f, .Kd=0, .integral=0, .prev_error=0, .integral_limit=INTEGRAL_LIMIT };
 
 void alg_inner_task(void *pvParameters) 
 {
@@ -422,8 +411,10 @@ void alg_inner_task(void *pvParameters)
      * because portTICK_PERIOD_MS = 1ms gives only 1ms resolution.
      * Actual dt oscillates ≈ 1.9–2.1ms — timer gives the correct value.
      */
-    uint64_t last_us   = esp_timer_get_time();
+#ifdef DEBUG_FLAG
     uint32_t log_count = 0;
+#endif
+    uint64_t last_us   = esp_timer_get_time();
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
 
@@ -491,15 +482,16 @@ void alg_inner_task(void *pvParameters)
         }
 
         /* 7. Periodic log (disabled by default) */
+#ifdef DEBUG_FLAG
         if (++log_count >= INNER_HZ * 2)
         {
-            // ESP_LOGI(TAG, "Inner | rsp=%.1f/%.1f/%.1f/%.1f gyr=%.1f/%.1f/%.1f | out=%u/%u/%u/%u",
-            //          throttle, roll_rate_sp, pitch_rate_sp, yaw_rate_sp,
-            //          gx_dps, gy_dps, gz_dps,
-            //          out.throttle, out.roll, out.pitch, out.yaw);
+            ESP_LOGI(TAG, "Inner | rsp=%.1f/%.1f/%.1f/%.1f gyr=%.1f/%.1f/%.1f | out=%u/%u/%u/%u",
+                     throttle, roll_rate_sp, pitch_rate_sp, yaw_rate_sp,
+                     gx_dps, gy_dps, gz_dps,
+                     out.throttle, out.roll, out.pitch, out.yaw);
             log_count = 0;
         }
-
+#endif
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }

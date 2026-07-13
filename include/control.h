@@ -76,12 +76,14 @@ extern "C" {
 
 
 /*==============================================================================
- * ESC PWM Configuration
+ * ESC general PWM Configuration
  *============================================================================*/
 
-#define ESC_PWM_FREQ_HZ           400
+#define ESC_PWM_FREQ_HZ           50
 #define ESC_PWM_MIN_US            1000
 #define ESC_PWM_MAX_US            2000
+#define ESC_PWM_CENTER_US         0
+#define ESC_PWM_RESOLUTION_BITS  12
 
 
 /*==============================================================================
@@ -125,6 +127,7 @@ typedef enum
     CFG_OUTPUT_TYPE_NONE = 0,
     CFG_OUTPUT_TYPE_DIGITAL,
     CFG_OUTPUT_TYPE_SERVO,
+    CFG_OUTPUT_TYPE_ESC_PWM,
     CFG_OUTPUT_TYPE_DSHOT300,
     CFG_OUTPUT_TYPE_DSHOT600
 
@@ -174,6 +177,15 @@ static const cfg_pwm_output_t PWM_CONFIG_SERVO =
     .resolution_bits = SG90_PWM_RESOLUTION_BITS
 };
 
+static const cfg_pwm_output_t PWM_CONFIG_ESC_GEN =
+{
+    .frequency_hz   = SG90_PWM_FREQ_HZ,
+    .min_value      = SG90_PWM_MIN_US,
+    .max_value      = SG90_PWM_MAX_US,
+    .center_value   = SG90_PWM_CENTER_US,
+    .resolution_bits = SG90_PWM_RESOLUTION_BITS
+};
+
 /*==============================================================================
  * Board Output Mapping
  *============================================================================*/
@@ -186,8 +198,8 @@ static const cfg_hw_output_t BOARD_OUTPUT_MAP[CONTROL_MAX_OUTPUTS] =
     {
         .timer_channel = TIM_CH_1,
         .gpio_num      = PIN_PWM_1,
-        .type          = CFG_OUTPUT_TYPE_SERVO,
-        .pwm_config    = PWM_CONFIG_SERVO
+        .type          = CFG_OUTPUT_TYPE_ESC_PWM,
+        .pwm_config    = PWM_CONFIG_ESC_GEN
     },
     {
         .timer_channel = TIM_CH_2,

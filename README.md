@@ -9,6 +9,15 @@
 
 ---
 
+# Release Notes
+
+| Version | Release Date | Highlights |
+|----------|--------------|------------|
+| v1.0 | 2026-07-10 | Initial public release |
+| v1.0.1 | 2026-07-13 | inner PID tuning and specific throttle channel |
+
+---
+
 # Overview
 
 This project aims to build a lightweight, modular and fully customizable Flight Controller (FC) for fixed-wing UAVs without relying on Betaflight, INAV or ArduPilot.
